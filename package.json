@@ -1,0 +1,5 @@
+{
+    "scripts": {
+        "build": "mkdir -p dist && cp -r bootstrap-4.env dist/bootstrap-4.env"
+    }
+}
