@@ -19,6 +19,11 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: us-east-1
 
+    - name: Build
+      run: |
+        mkdir -p dist && cp -r bootstrap-4.env dist/bootstrap-4.env
+
+
     - name: Deploy bootstrap config
       run: |
         aws s3 sync ./dist s3://bootstrap-peerchecker-com-dist --delete
