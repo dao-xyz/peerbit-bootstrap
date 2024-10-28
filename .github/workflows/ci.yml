@@ -26,5 +26,5 @@ jobs:
 
     - name: Deploy bootstrap config
       run: |
-        aws s3 sync ./dist s3://bootstrap-peerchecker-com-dist --delete
+        aws s3 sync ./dist s3://bootstrap-peerbit-org-dist --delete
         aws cloudfront create-invalidation --distribution-id ETKLQVXX2I9CQ --paths '/*';
