@@ -19,9 +19,6 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: us-east-1
 
-    - name: Build
-      run: yarn install && yarn build
-
     - name: Deploy bootstrap config
       run: |
         aws s3 sync ./bootstrap-4.env s3://bootstrap-peerchecker-com-dist --delete
