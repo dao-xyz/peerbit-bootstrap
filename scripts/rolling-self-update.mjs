@@ -88,11 +88,24 @@ const waitForReady = async (api, remote, timeoutMs, delayMs) => {
   );
 };
 
-const getServerVersion = async (api) => {
+const getVersionInfo = async (api) => {
   const versions = await api.dependency.versions();
-  const v = versions["@peerbit/server"];
-  ensure(typeof v === "string" && v.length > 0, "Missing @peerbit/server version");
-  return v;
+  const serverVersion =
+    typeof versions["@peerbit/server"] === "string" && versions["@peerbit/server"].length > 0
+      ? versions["@peerbit/server"]
+      : undefined;
+  const peerbitVersion =
+    typeof versions["peerbit"] === "string" && versions["peerbit"].length > 0
+      ? versions["peerbit"]
+      : undefined;
+  return { versions, serverVersion, peerbitVersion };
+};
+
+const describeVersion = (info) => {
+  if (info.serverVersion) return `@peerbit/server@${info.serverVersion}`;
+  if (info.peerbitVersion) return `peerbit@${info.peerbitVersion}`;
+  const keys = Object.keys(info.versions || {});
+  return keys.length > 0 ? `unknown-key(${keys.join(",")})` : "unknown";
 };
 
 const chunk = (arr, size) => {
@@ -127,9 +140,24 @@ const run = async () => {
     const api = await createClient(keypair, { address: remote.address });
     await waitForReady(api, remote, waitReadyTimeoutMs, waitReadyDelayMs);
     const peerId = await api.peer.id.get();
-    const previousVersion = await getServerVersion(api);
-    console.log(`${remote.name}: preflight ready (peerId=${peerId}, version=${previousVersion})`);
-    state.push({ remote, previousVersion });
+    const previousVersionInfo = await getVersionInfo(api);
+    if (!previousVersionInfo.serverVersion) {
+      console.warn(
+        `${remote.name}: @peerbit/server not listed in dependency versions; using fallback visibility (${describeVersion(
+          previousVersionInfo,
+        )})`,
+      );
+    }
+    console.log(
+      `${remote.name}: preflight ready (peerId=${peerId}, version=${describeVersion(
+        previousVersionInfo,
+      )})`,
+    );
+    state.push({
+      remote,
+      previousVersion: previousVersionInfo.serverVersion,
+      previousVersionInfo,
+    });
   }
 
   const updated = [];
@@ -140,16 +168,26 @@ const run = async () => {
     console.log(`Starting rollback for ${targets.length} node(s)`);
     for (const item of targets) {
       try {
+        if (!item.previousVersion) {
+          console.warn(
+            `${item.remote.name}: skipping rollback because previous @peerbit/server version is unknown`,
+          );
+          continue;
+        }
         const api = await createClient(keypair, { address: item.remote.address });
         await api.selfUpdate(item.previousVersion);
         await waitForReady(api, item.remote, waitReadyTimeoutMs, waitReadyDelayMs);
-        const versionAfter = await getServerVersion(api);
-        if (versionAfter !== item.previousVersion) {
+        const versionInfoAfter = await getVersionInfo(api);
+        if (versionInfoAfter.serverVersion !== item.previousVersion) {
           throw new Error(
-            `rollback version mismatch: expected ${item.previousVersion}, got ${versionAfter}`,
+            `rollback version mismatch: expected ${item.previousVersion}, got ${describeVersion(
+              versionInfoAfter,
+            )}`,
           );
         }
-        console.log(`${item.remote.name}: rollback complete -> ${versionAfter}`);
+        console.log(
+          `${item.remote.name}: rollback complete -> ${describeVersion(versionInfoAfter)}`,
+        );
       } catch (error) {
         console.error(`${item.remote.name}: rollback failed`, error);
       }
@@ -165,13 +203,25 @@ const run = async () => {
         const api = await createClient(keypair, { address: item.remote.address });
         const resp = await api.selfUpdate(targetVersion);
         await waitForReady(api, item.remote, waitReadyTimeoutMs, waitReadyDelayMs);
-        const versionAfter = await getServerVersion(api);
-        if (versionAfter !== resp.version) {
-          throw new Error(
-            `version mismatch after update: expected ${resp.version}, got ${versionAfter}`,
+        const versionInfoAfter = await getVersionInfo(api);
+        if (versionInfoAfter.serverVersion) {
+          if (versionInfoAfter.serverVersion !== resp.version) {
+            throw new Error(
+              `version mismatch after update: expected @peerbit/server@${resp.version}, got ${describeVersion(
+                versionInfoAfter,
+              )}`,
+            );
+          }
+        } else {
+          console.warn(
+            `${item.remote.name}: @peerbit/server not listed after update; readiness succeeded with ${describeVersion(
+              versionInfoAfter,
+            )}`,
           );
         }
-        console.log(`${item.remote.name}: update complete -> ${versionAfter}`);
+        console.log(
+          `${item.remote.name}: update complete -> ${describeVersion(versionInfoAfter)}`,
+        );
         return item;
       }),
     );
