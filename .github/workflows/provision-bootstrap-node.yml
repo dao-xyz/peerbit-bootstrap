@@ -1,0 +1,143 @@
+name: Provision Bootstrap Node
+
+on:
+  workflow_dispatch:
+    inputs:
+      count:
+        description: "Number of bootstrap nodes to create"
+        required: false
+        default: "1"
+        type: string
+      location:
+        description: "Hetzner location (for example fsn1, nbg1, hel1)"
+        required: false
+        default: "fsn1"
+        type: string
+      server_type:
+        description: "Hetzner server type"
+        required: false
+        default: "cx11"
+        type: choice
+        options:
+          - cx11
+          - cx21
+          - cx31
+          - cx41
+          - cx51
+          - cax11
+          - cax21
+          - cax31
+          - cax41
+      name_prefix:
+        description: "Name prefix for new node(s)"
+        required: false
+        default: "bs-5.0.0"
+        type: string
+      server_version:
+        description: "@peerbit/server version to install (for example 6.0.0)"
+        required: false
+        default: "6.0.0"
+        type: string
+      email:
+        description: "Email for Let's Encrypt security notices"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  provision:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Resolve rollout admin peer id
+        id: admin
+        env:
+          PEERBIT_ADMIN_KEY_B64: ${{ secrets.PEERBIT_ADMIN_KEY_B64 }}
+        run: |
+          admin_peer_id="$(node --input-type=module -e '
+            import { deserialize } from "@dao-xyz/borsh";
+            import { Ed25519Keypair } from "@peerbit/crypto";
+            const bytes = Buffer.from(process.env.PEERBIT_ADMIN_KEY_B64 || "", "base64");
+            if (!bytes.length) throw new Error("Missing PEERBIT_ADMIN_KEY_B64");
+            const kp = deserialize(bytes, Ed25519Keypair);
+            const peerId = await kp.publicKey.toPeerId();
+            process.stdout.write(peerId.toString());
+          ')"
+          echo "peer_id=$admin_peer_id" >> "$GITHUB_OUTPUT"
+          echo "Resolved admin peer id: $admin_peer_id"
+
+      - name: Spawn bootstrap node(s)
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+        run: |
+          npx peerbit remote spawn hetzner \
+            --count "${{ inputs.count }}" \
+            --location "${{ inputs.location }}" \
+            --group "bootstrap" \
+            --server-type "${{ inputs.server_type }}" \
+            --name "${{ inputs.name_prefix }}" \
+            --email "${{ inputs.email }}" \
+            --token "$HCLOUD_TOKEN" \
+            --directory ".peerbit" \
+            --grant-access "${{ steps.admin.outputs.peer_id }}" \
+            --server-version "${{ inputs.server_version }}"
+
+      - name: Export created remotes
+        id: created
+        run: |
+          node --input-type=module <<'EOF'
+          import fs from "node:fs";
+
+          const remotesPath = ".peerbit/remotes.json";
+          if (!fs.existsSync(remotesPath)) {
+            throw new Error(`Missing remotes file: ${remotesPath}`);
+          }
+          const content = JSON.parse(fs.readFileSync(remotesPath, "utf8"));
+          const remotes = Array.isArray(content?.remotes) ? content.remotes : [];
+          const bootstrapRemotes = remotes.filter((r) => r?.group === "bootstrap");
+
+          if (bootstrapRemotes.length === 0) {
+            throw new Error("No bootstrap remotes were created");
+          }
+
+          const domains = bootstrapRemotes.map((r) => r.address);
+          const multiaddrs = domains.map((d) => `/dns4/${d}/tcp/9002/tls`);
+
+          const outputPath = process.env.GITHUB_OUTPUT;
+          const lines = [
+            `domains=${domains.join(",")}`,
+            `multiaddrs=${multiaddrs.join(",")}`,
+          ];
+          fs.appendFileSync(outputPath, lines.map((x) => `${x}\n`).join(""));
+
+          console.log("Created bootstrap remotes:");
+          bootstrapRemotes.forEach((r) => {
+            console.log(`- ${r.name}: ${r.address}`);
+          });
+          EOF
+
+      - name: Upload remotes metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: created-bootstrap-remotes
+          path: .peerbit/remotes.json
+
+      - name: Summary
+        run: |
+          echo "### Provisioned bootstrap remotes" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- domains: \`${{ steps.created.outputs.domains }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- multiaddrs: \`${{ steps.created.outputs.multiaddrs }}\`" >> "$GITHUB_STEP_SUMMARY"
