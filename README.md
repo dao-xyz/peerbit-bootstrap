@@ -4,10 +4,18 @@ Relay server for bootstrapping Peerbit applications.
 
 This environment file contains a list of addresses you can initially connect to.
 
-Check the Peerbit client version you are using. For v4:
+Check the Peerbit client/network version you are using.
+
+For v4:
 
 ```
 https://raw.githubusercontent.com/dao-xyz/peerbit-bootstrap/master/bootstrap-4.env
+```
+
+For v5:
+
+```
+https://raw.githubusercontent.com/dao-xyz/peerbit-bootstrap/master/bootstrap-5.env
 ```
 
 ## Rolling self-update workflow
@@ -32,5 +40,6 @@ Configure this repository secret in the `production` environment:
 ### Typical run settings
 
 - `target_version`: release version to deploy (for example `5.10.14`)
+- `bootstrap_file`: `bootstrap-4.env` or `bootstrap-5.env`
 - `batch_size`: `1` for safest rolling update
 - `rollback_on_failure`: `true`
