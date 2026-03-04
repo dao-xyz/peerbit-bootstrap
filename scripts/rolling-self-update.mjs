@@ -101,6 +101,24 @@ const getVersionInfo = async (api) => {
   return { versions, serverVersion, peerbitVersion };
 };
 
+const waitForVersionInfo = async (api, remote, timeoutMs, delayMs) => {
+  const start = Date.now();
+  let lastError;
+  while (Date.now() - start < timeoutMs) {
+    try {
+      return await getVersionInfo(api);
+    } catch (error) {
+      lastError = error;
+      await sleep(delayMs);
+    }
+  }
+  throw new Error(
+    `Timed out waiting for ${remote.name} (${remote.address}) version endpoint to recover. Last error: ${
+      lastError?.message || lastError || "unknown"
+    }`,
+  );
+};
+
 const describeVersion = (info) => {
   if (info.serverVersion) return `@peerbit/server@${info.serverVersion}`;
   if (info.peerbitVersion) return `peerbit@${info.peerbitVersion}`;
@@ -140,7 +158,12 @@ const run = async () => {
     const api = await createClient(keypair, { address: remote.address });
     await waitForReady(api, remote, waitReadyTimeoutMs, waitReadyDelayMs);
     const peerId = await api.peer.id.get();
-    const previousVersionInfo = await getVersionInfo(api);
+    const previousVersionInfo = await waitForVersionInfo(
+      api,
+      remote,
+      waitReadyTimeoutMs,
+      waitReadyDelayMs,
+    );
     if (!previousVersionInfo.serverVersion) {
       console.warn(
         `${remote.name}: @peerbit/server not listed in dependency versions; using fallback visibility (${describeVersion(
@@ -177,7 +200,12 @@ const run = async () => {
         const api = await createClient(keypair, { address: item.remote.address });
         await api.selfUpdate(item.previousVersion);
         await waitForReady(api, item.remote, waitReadyTimeoutMs, waitReadyDelayMs);
-        const versionInfoAfter = await getVersionInfo(api);
+        const versionInfoAfter = await waitForVersionInfo(
+          api,
+          item.remote,
+          waitReadyTimeoutMs,
+          waitReadyDelayMs,
+        );
         if (versionInfoAfter.serverVersion !== item.previousVersion) {
           throw new Error(
             `rollback version mismatch: expected ${item.previousVersion}, got ${describeVersion(
@@ -203,7 +231,12 @@ const run = async () => {
         const api = await createClient(keypair, { address: item.remote.address });
         const resp = await api.selfUpdate(targetVersion);
         await waitForReady(api, item.remote, waitReadyTimeoutMs, waitReadyDelayMs);
-        const versionInfoAfter = await getVersionInfo(api);
+        const versionInfoAfter = await waitForVersionInfo(
+          api,
+          item.remote,
+          waitReadyTimeoutMs,
+          waitReadyDelayMs,
+        );
         if (versionInfoAfter.serverVersion) {
           if (versionInfoAfter.serverVersion !== resp.version) {
             throw new Error(
