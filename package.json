@@ -1,0 +1,13 @@
+{
+  "name": "peerbit-bootstrap-ops",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "rolling-self-update": "node scripts/rolling-self-update.mjs"
+  },
+  "dependencies": {
+    "@dao-xyz/borsh": "^6.0.1",
+    "@peerbit/crypto": "^2.4.1",
+    "@peerbit/server": "^5.10.14"
+  }
+}

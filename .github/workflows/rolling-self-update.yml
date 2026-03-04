@@ -1,0 +1,67 @@
+name: Rolling Bootstrap Self-Update
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_version:
+        description: "Target @peerbit/server version (for example 5.10.14)"
+        required: true
+        type: string
+      bootstrap_file:
+        description: "Bootstrap file path in repo"
+        required: false
+        default: "bootstrap-4.env"
+        type: string
+      batch_size:
+        description: "Nodes to update in parallel per batch"
+        required: false
+        default: "1"
+        type: string
+      wait_ready_timeout_ms:
+        description: "Readiness timeout per node in ms"
+        required: false
+        default: "180000"
+        type: string
+      wait_ready_delay_ms:
+        description: "Readiness poll interval in ms"
+        required: false
+        default: "3000"
+        type: string
+      rollback_on_failure:
+        description: "Attempt rollback to per-node previous version on failure"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  rolling_update:
+    runs-on: ubuntu-22.04
+    environment: production
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Rolling self-update
+        env:
+          PEERBIT_ADMIN_KEY_B64: ${{ secrets.PEERBIT_ADMIN_KEY_B64 }}
+        run: |
+          node scripts/rolling-self-update.mjs \
+            --bootstrap-file "${{ inputs.bootstrap_file }}" \
+            --target-version "${{ inputs.target_version }}" \
+            --batch-size "${{ inputs.batch_size }}" \
+            --wait-ready-timeout-ms "${{ inputs.wait_ready_timeout_ms }}" \
+            --wait-ready-delay-ms "${{ inputs.wait_ready_delay_ms }}" \
+            --rollback-on-failure "${{ inputs.rollback_on_failure }}"
