@@ -21,7 +21,8 @@ jobs:
 
     - name: Build
       run: |
-        mkdir -p dist && cp -r bootstrap-4.env dist/bootstrap-4.env
+        mkdir -p dist
+        cp -r bootstrap-*.env dist/
 
 
     - name: Deploy bootstrap config
