@@ -16,7 +16,7 @@ on:
       server_type:
         description: "Hetzner server type"
         required: false
-        default: "cx11"
+        default: "cax11"
         type: choice
         options:
           - cx11
@@ -129,6 +129,27 @@ jobs:
           });
           EOF
 
+      - name: Wait for API reachability
+        run: |
+          IFS=',' read -ra domains <<< "${{ steps.created.outputs.domains }}"
+          for domain in "${domains[@]}"; do
+            echo "Waiting for $domain:9002 /peer/id"
+            ready=0
+            for i in {1..120}; do
+              code="$(curl -sk --max-time 5 -o /tmp/peerid.txt -w "%{http_code}" "https://${domain}:9002/peer/id" || true)"
+              if [ "$code" = "200" ]; then
+                echo "$domain ready: $(cat /tmp/peerid.txt)"
+                ready=1
+                break
+              fi
+              sleep 5
+            done
+            if [ "$ready" -ne 1 ]; then
+              echo "::error::Timed out waiting for $domain API to become reachable on :9002"
+              exit 1
+            fi
+          done
+
       - name: Upload remotes metadata
         uses: actions/upload-artifact@v4
         with:
@@ -141,3 +162,4 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "- domains: \`${{ steps.created.outputs.domains }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- multiaddrs: \`${{ steps.created.outputs.multiaddrs }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- API readiness: verified on \`:9002/peer/id\`" >> "$GITHUB_STEP_SUMMARY"
