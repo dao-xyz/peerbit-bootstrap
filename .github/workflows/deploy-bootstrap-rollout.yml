@@ -1,0 +1,54 @@
+name: Deploy Bootstrap Rollout
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - rollouts/bootstrap-5.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-22.04
+    outputs:
+      bootstrap_file: ${{ steps.config.outputs.bootstrap_file }}
+      target_version: ${{ steps.config.outputs.target_version }}
+      batch_size: ${{ steps.config.outputs.batch_size }}
+      wait_ready_timeout_ms: ${{ steps.config.outputs.wait_ready_timeout_ms }}
+      wait_ready_delay_ms: ${{ steps.config.outputs.wait_ready_delay_ms }}
+      rollback_on_failure: ${{ steps.config.outputs.rollback_on_failure }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read rollout config
+        id: config
+        run: |
+          node <<'EOF'
+          const fs = require("node:fs");
+          const config = JSON.parse(fs.readFileSync("rollouts/bootstrap-5.json", "utf8"));
+          const output = process.env.GITHUB_OUTPUT;
+          const write = (key, value) => fs.appendFileSync(output, `${key}=${value}\n`);
+          write("bootstrap_file", config.bootstrapFile);
+          write("target_version", config.targetVersion);
+          write("batch_size", String(config.batchSize));
+          write("wait_ready_timeout_ms", String(config.waitReadyTimeoutMs));
+          write("wait_ready_delay_ms", String(config.waitReadyDelayMs));
+          write("rollback_on_failure", String(config.rollbackOnFailure));
+          EOF
+
+  rollout:
+    needs: plan
+    uses: ./.github/workflows/rolling-self-update.yml
+    with:
+      bootstrap_file: ${{ needs.plan.outputs.bootstrap_file }}
+      target_version: ${{ needs.plan.outputs.target_version }}
+      batch_size: ${{ needs.plan.outputs.batch_size }}
+      wait_ready_timeout_ms: ${{ needs.plan.outputs.wait_ready_timeout_ms }}
+      wait_ready_delay_ms: ${{ needs.plan.outputs.wait_ready_delay_ms }}
+      rollback_on_failure: ${{ needs.plan.outputs.rollback_on_failure == 'true' }}
+    secrets: inherit
