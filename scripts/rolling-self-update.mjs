@@ -24,6 +24,14 @@ const parseArgs = (argv) => {
   return result;
 };
 
+const readConfigFile = (configFile) => {
+  const file = path.resolve(process.cwd(), configFile);
+  ensure(fs.existsSync(file), `Missing config file: ${file}`);
+  const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+  ensure(parsed && typeof parsed === "object", `Invalid config file: ${file}`);
+  return parsed;
+};
+
 const ensure = (condition, message) => {
   if (!condition) throw new Error(message);
 };
@@ -136,12 +144,20 @@ const chunk = (arr, size) => {
 
 const run = async () => {
   const args = parseArgs(process.argv);
-  const bootstrapFile = args["bootstrap-file"] || "bootstrap-4.env";
-  const targetVersion = args["target-version"];
-  const batchSize = Math.max(1, Number(args["batch-size"] || "1"));
-  const waitReadyTimeoutMs = Math.max(1_000, Number(args["wait-ready-timeout-ms"] || "180000"));
-  const waitReadyDelayMs = Math.max(200, Number(args["wait-ready-delay-ms"] || "3000"));
-  const rollbackOnFailure = String(args["rollback-on-failure"] || "true") === "true";
+  const config = args["config-file"] ? readConfigFile(args["config-file"]) : {};
+  const bootstrapFile = args["bootstrap-file"] || config.bootstrapFile || "bootstrap-4.env";
+  const targetVersion = args["target-version"] || config.targetVersion;
+  const batchSize = Math.max(1, Number(args["batch-size"] || config.batchSize || "1"));
+  const waitReadyTimeoutMs = Math.max(
+    1_000,
+    Number(args["wait-ready-timeout-ms"] || config.waitReadyTimeoutMs || "180000"),
+  );
+  const waitReadyDelayMs = Math.max(
+    200,
+    Number(args["wait-ready-delay-ms"] || config.waitReadyDelayMs || "3000"),
+  );
+  const rollbackOnFailure =
+    String(args["rollback-on-failure"] ?? config.rollbackOnFailure ?? "true") === "true";
 
   ensure(
     typeof targetVersion === "string" && targetVersion.length > 0,
@@ -228,6 +244,12 @@ const run = async () => {
 
     const settled = await Promise.allSettled(
       batch.map(async (item) => {
+        if (item.previousVersion === targetVersion) {
+          console.log(
+            `${item.remote.name}: already on @peerbit/server@${targetVersion}, skipping update`,
+          );
+          return item;
+        }
         const api = await createClient(keypair, { address: item.remote.address });
         const resp = await api.selfUpdate(targetVersion);
         await waitForReady(api, item.remote, waitReadyTimeoutMs, waitReadyDelayMs);

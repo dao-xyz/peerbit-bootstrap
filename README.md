@@ -30,6 +30,25 @@ It performs rolling updates of the bootstrap fleet using each node's remote
 If a batch fails, the workflow can automatically roll back updated nodes to
 their per-node previous `@peerbit/server` version.
 
+## PR-driven bootstrap rollouts
+
+This repo also supports a tracked rollout manifest:
+
+- `rollouts/bootstrap-5.json`
+
+Merging a PR that changes that file on `master` triggers:
+
+- `Deploy Bootstrap Rollout`
+
+That workflow reads the manifest and then calls the reusable
+`Rolling Bootstrap Self-Update` workflow. This keeps production rollout behind
+a normal PR review while avoiding manual workflow dispatch for routine server
+updates.
+
+The deploy script skips nodes that are already on the requested
+`@peerbit/server` version, so rerunning or merging a no-op rollout does not
+force an unnecessary restart.
+
 ### Required secret
 
 Configure this repository secret in the `production` environment:

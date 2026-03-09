@@ -32,6 +32,34 @@ on:
         required: false
         default: true
         type: boolean
+  workflow_call:
+    inputs:
+      target_version:
+        required: true
+        type: string
+      bootstrap_file:
+        required: false
+        default: "bootstrap-4.env"
+        type: string
+      batch_size:
+        required: false
+        default: "1"
+        type: string
+      wait_ready_timeout_ms:
+        required: false
+        default: "180000"
+        type: string
+      wait_ready_delay_ms:
+        required: false
+        default: "3000"
+        type: string
+      rollback_on_failure:
+        required: false
+        default: true
+        type: boolean
+    secrets:
+      PEERBIT_ADMIN_KEY_B64:
+        required: true
 
 permissions:
   contents: read
@@ -41,6 +69,9 @@ jobs:
     runs-on: ubuntu-22.04
     environment: production
     timeout-minutes: 45
+    concurrency:
+      group: rolling-self-update-${{ inputs.bootstrap_file }}
+      cancel-in-progress: false
     steps:
       - name: Checkout
         uses: actions/checkout@v4
