@@ -4,5 +4,6 @@
   "batchSize": 1,
   "waitReadyTimeoutMs": 180000,
   "waitReadyDelayMs": 3000,
-  "rollbackOnFailure": true
+  "rollbackOnFailure": true,
+  "rerollReason": "crypto-3.0.1-override"
 }
