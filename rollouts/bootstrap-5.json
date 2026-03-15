@@ -5,5 +5,5 @@
   "waitReadyTimeoutMs": 180000,
   "waitReadyDelayMs": 3000,
   "rollbackOnFailure": true,
-  "rerollReason": "crypto-3.0.1-override"
+  "rerollReason": "crypto-3.0.1-dollar-override"
 }
