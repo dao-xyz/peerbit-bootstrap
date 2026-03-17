@@ -8,7 +8,7 @@
   "dependencies": {
     "@dao-xyz/borsh": "^6.0.1",
     "@peerbit/crypto": "3.0.1",
-    "@peerbit/server": "^6.0.12"
+    "@peerbit/server": "^6.0.13"
   },
   "overrides": {
     "@peerbit/crypto": "$@peerbit/crypto"
