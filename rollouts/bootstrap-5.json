@@ -1,9 +1,9 @@
 {
   "bootstrapFile": "bootstrap-5.env",
-  "targetVersion": "6.0.12",
+  "targetVersion": "6.0.15",
   "batchSize": 1,
   "waitReadyTimeoutMs": 180000,
   "waitReadyDelayMs": 3000,
   "rollbackOnFailure": true,
-  "rerollReason": "crypto-3.0.1-override-v2"
+  "rerollReason": "peerbit-5.2.0-dial-root-discovery"
 }
