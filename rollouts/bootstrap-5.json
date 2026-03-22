@@ -1,9 +1,9 @@
 {
   "bootstrapFile": "bootstrap-5.env",
-  "targetVersion": "6.0.15",
+  "targetVersion": "6.0.16",
   "batchSize": 1,
   "waitReadyTimeoutMs": 180000,
   "waitReadyDelayMs": 3000,
   "rollbackOnFailure": true,
-  "rerollReason": "peerbit-5.2.0-dial-root-discovery"
+  "rerollReason": "peerbit-5.2.1-waitfor-fixes"
 }
