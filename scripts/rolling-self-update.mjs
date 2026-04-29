@@ -1,5 +1,8 @@
 #!/usr/bin/env node
+import crypto from "node:crypto";
 import fs from "node:fs";
+import http from "node:http";
+import https from "node:https";
 import path from "node:path";
 import { deserialize } from "@dao-xyz/borsh";
 import { Ed25519Keypair } from "@peerbit/crypto";
@@ -57,10 +60,16 @@ const readBootstrapRemotes = (bootstrapFile) => {
     seen.add(key);
 
     const protocol = hostType.startsWith("ip") ? "http" : "https";
+    const wsMatch = line.match(/\/tcp\/(\d+)\/(ws|wss)(?:\/|$)/);
+    const wsHost = hostType === "ip6" || host.includes(":") ? `[${host}]` : host;
+    const publicWebSocketAddress = wsMatch
+      ? `${wsMatch[2] === "wss" ? "https" : "http"}://${wsHost}:${wsMatch[1]}/`
+      : undefined;
     remotes.push({
       name: `bootstrap-${remotes.length + 1}`,
       host,
       address: `${protocol}://${host}`,
+      publicWebSocketAddress,
     });
   }
   ensure(remotes.length > 0, `No remotes resolved from ${bootstrapFile}`);
@@ -91,6 +100,67 @@ const waitForReady = async (api, remote, timeoutMs, delayMs) => {
   }
   throw new Error(
     `Timed out waiting for ${remote.name} (${remote.address}) to become ready. Last error: ${
+      lastError?.message || lastError || "unknown"
+    }`,
+  );
+};
+
+const probePublicWebSocket = async (remote) => {
+  if (!remote.publicWebSocketAddress) return;
+
+  await new Promise((resolve, reject) => {
+    const url = new URL(remote.publicWebSocketAddress);
+    const client = url.protocol === "https:" ? https : http;
+    const req = client.request(url, {
+      method: "GET",
+      headers: {
+        Connection: "Upgrade",
+        Upgrade: "websocket",
+        "Sec-WebSocket-Version": "13",
+        "Sec-WebSocket-Key": crypto.randomBytes(16).toString("base64"),
+      },
+    });
+
+    req.setTimeout(10_000, () => {
+      req.destroy(new Error("public WebSocket probe timed out"));
+    });
+
+    req.on("upgrade", (res, socket) => {
+      socket.destroy();
+      if (res.statusCode === 101) {
+        resolve();
+        return;
+      }
+      reject(new Error(`expected HTTP 101, got ${res.statusCode ?? "unknown"}`));
+    });
+
+    req.on("response", (res) => {
+      res.resume();
+      reject(new Error(`expected HTTP 101, got ${res.statusCode ?? "unknown"}`));
+    });
+
+    req.on("error", reject);
+    req.end();
+  });
+};
+
+const waitForPublicWebSocket = async (remote, timeoutMs, delayMs) => {
+  if (!remote.publicWebSocketAddress) return;
+
+  const start = Date.now();
+  let lastError;
+  while (Date.now() - start < timeoutMs) {
+    try {
+      await probePublicWebSocket(remote);
+      return;
+    } catch (error) {
+      lastError = error;
+      await sleep(delayMs);
+    }
+  }
+
+  throw new Error(
+    `Timed out waiting for ${remote.name} (${remote.publicWebSocketAddress}) public WebSocket. Last error: ${
       lastError?.message || lastError || "unknown"
     }`,
   );
@@ -173,6 +243,7 @@ const run = async () => {
   for (const remote of remotes) {
     const api = await createClient(keypair, { address: remote.address });
     await waitForReady(api, remote, waitReadyTimeoutMs, waitReadyDelayMs);
+    await waitForPublicWebSocket(remote, waitReadyTimeoutMs, waitReadyDelayMs);
     const peerId = await api.peer.id.get();
     const previousVersionInfo = await waitForVersionInfo(
       api,
@@ -216,6 +287,11 @@ const run = async () => {
         const api = await createClient(keypair, { address: item.remote.address });
         await api.selfUpdate(item.previousVersion);
         await waitForReady(api, item.remote, waitReadyTimeoutMs, waitReadyDelayMs);
+        await waitForPublicWebSocket(
+          item.remote,
+          waitReadyTimeoutMs,
+          waitReadyDelayMs,
+        );
         const versionInfoAfter = await waitForVersionInfo(
           api,
           item.remote,
@@ -253,6 +329,11 @@ const run = async () => {
         const api = await createClient(keypair, { address: item.remote.address });
         const resp = await api.selfUpdate(targetVersion);
         await waitForReady(api, item.remote, waitReadyTimeoutMs, waitReadyDelayMs);
+        await waitForPublicWebSocket(
+          item.remote,
+          waitReadyTimeoutMs,
+          waitReadyDelayMs,
+        );
         const versionInfoAfter = await waitForVersionInfo(
           api,
           item.remote,
