@@ -243,7 +243,17 @@ const run = async () => {
   for (const remote of remotes) {
     const api = await createClient(keypair, { address: remote.address });
     await waitForReady(api, remote, waitReadyTimeoutMs, waitReadyDelayMs);
-    await waitForPublicWebSocket(remote, waitReadyTimeoutMs, waitReadyDelayMs);
+    let preflightPublicWebSocketReady = true;
+    try {
+      await waitForPublicWebSocket(remote, waitReadyTimeoutMs, waitReadyDelayMs);
+    } catch (error) {
+      preflightPublicWebSocketReady = false;
+      console.warn(
+        `${remote.name}: public WebSocket preflight failed; continuing because self-update may recover the node. Last error: ${
+          error?.message || error || "unknown"
+        }`,
+      );
+    }
     const peerId = await api.peer.id.get();
     const previousVersionInfo = await waitForVersionInfo(
       api,
@@ -267,6 +277,7 @@ const run = async () => {
       remote,
       previousVersion: previousVersionInfo.serverVersion,
       previousVersionInfo,
+      preflightPublicWebSocketReady,
     });
   }
 
@@ -320,11 +331,19 @@ const run = async () => {
 
     const settled = await Promise.allSettled(
       batch.map(async (item) => {
-        if (item.previousVersion === targetVersion) {
+        const needsUpdate =
+          item.previousVersion !== targetVersion ||
+          item.preflightPublicWebSocketReady === false;
+        if (!needsUpdate) {
           console.log(
             `${item.remote.name}: already on @peerbit/server@${targetVersion}, skipping update`,
           );
           return item;
+        }
+        if (item.previousVersion === targetVersion) {
+          console.log(
+            `${item.remote.name}: already on @peerbit/server@${targetVersion}, but public WebSocket preflight failed; re-running self-update`,
+          );
         }
         const api = await createClient(keypair, { address: item.remote.address });
         const resp = await api.selfUpdate(targetVersion);
