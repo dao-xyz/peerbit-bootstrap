@@ -49,6 +49,10 @@ The deploy script skips nodes that are already on the requested
 `@peerbit/server` version, so rerunning or merging a no-op rollout does not
 force an unnecessary restart.
 
+If a node's public WebSocket is already unhealthy, the rollout logs that
+preflight failure as a warning and still attempts `self-update`; the public
+WebSocket check remains required after update and rollback.
+
 ### Required secret
 
 Configure this repository secret in the `production` environment:
