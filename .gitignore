@@ -1,2 +1,5 @@
 dist
 node_modules
+tools/wrangler/node_modules
+.wrangler
+.wrangler-dry-run

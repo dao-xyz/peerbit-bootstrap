@@ -1,0 +1,41 @@
+name: Monitor bootstrap production
+
+on:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: monitor-bootstrap-production
+  cancel-in-progress: true
+
+jobs:
+  monitor:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.x
+
+      - name: Validate source configuration
+        run: node scripts/build-bootstrap.mjs
+
+      - name: Verify published configuration
+        run: >-
+          node scripts/verify-public.mjs
+          --base-url https://bootstrap.peerbit.org
+          --attempts 3
+          --delay-ms 10000
+
+      - name: Probe relay DNS, TLS, peer identity, and WebSocket
+        run: node scripts/monitor-relays.mjs
