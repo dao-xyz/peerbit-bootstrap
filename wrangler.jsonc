@@ -1,0 +1,17 @@
+{
+  "$schema": "tools/wrangler/node_modules/wrangler/config-schema.json",
+  "name": "peerbit-bootstrap",
+  "compatibility_date": "2026-07-13",
+  "workers_dev": false,
+  "assets": {
+    "directory": "./dist",
+    "html_handling": "none",
+    "not_found_handling": "none",
+  },
+  "routes": [
+    {
+      "pattern": "bootstrap.peerbit.org",
+      "custom_domain": true,
+    },
+  ],
+}

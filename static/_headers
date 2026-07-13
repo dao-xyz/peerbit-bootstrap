@@ -1,0 +1,17 @@
+/bootstrap-4.env
+  Access-Control-Allow-Origin: *
+  Access-Control-Expose-Headers: ETag
+  Cache-Control: public, max-age=0, must-revalidate
+  Content-Type: text/plain; charset=utf-8
+  Cross-Origin-Resource-Policy: cross-origin
+  X-Content-Type-Options: nosniff
+  X-Robots-Tag: noindex
+
+/bootstrap-5.env
+  Access-Control-Allow-Origin: *
+  Access-Control-Expose-Headers: ETag
+  Cache-Control: public, max-age=0, must-revalidate
+  Content-Type: text/plain; charset=utf-8
+  Cross-Origin-Resource-Policy: cross-origin
+  X-Content-Type-Options: nosniff
+  X-Robots-Tag: noindex

@@ -1,68 +1,94 @@
-# Peerbit Bootstrap  🚀
+# Peerbit Bootstrap 🚀
 
-Relay server for bootstrapping Peerbit applications.
+Bootstrap relay lists for Peerbit applications.
 
-This environment file contains a list of addresses you can initially connect to.
+Use the list matching the Peerbit client/network version:
 
-Check the Peerbit client/network version you are using.
+- v4: <https://bootstrap.peerbit.org/bootstrap-4.env>
+- v5: <https://bootstrap.peerbit.org/bootstrap-5.env>
 
-For v4:
+The source files on GitHub are an independent emergency fallback:
 
+- v4: <https://raw.githubusercontent.com/dao-xyz/peerbit-bootstrap/master/bootstrap-4.env>
+- v5: <https://raw.githubusercontent.com/dao-xyz/peerbit-bootstrap/master/bootstrap-5.env>
+
+## Cloudflare hosting
+
+The two files are deployed atomically as static assets on an asset-only Cloudflare
+Worker. `wrangler.jsonc` owns the `bootstrap.peerbit.org` custom domain, including
+DNS and TLS. There is no Worker application code and no AWS dependency.
+
+Every deployment validates the source format, builds `dist/` from scratch, runs a
+Wrangler dry run, and verifies production after deployment. Production verification
+requires exact bytes and SHA-256, strict HTTPS, CORS, cache and security headers,
+ETag revalidation, and a 404 for unknown paths.
+
+Wrangler and all of its transitive dependencies are installed from the committed
+lockfile without lifecycle scripts before deployment credentials enter the process.
+
+The stable filenames intentionally use:
+
+```text
+Cache-Control: public, max-age=0, must-revalidate
 ```
-https://raw.githubusercontent.com/dao-xyz/peerbit-bootstrap/master/bootstrap-4.env
-```
 
-For v5:
+This allows ETag revalidation without leaving clients on a stale relay list.
 
-```
-https://raw.githubusercontent.com/dao-xyz/peerbit-bootstrap/master/bootstrap-5.env
-```
+### GitHub production environment
+
+The deploy job requires these environment-scoped values:
+
+- Secret `CLOUDFLARE_API_TOKEN`
+- Variable `CLOUDFLARE_ACCOUNT_ID`
+
+The token is scoped to this Cloudflare account and only:
+
+- Account → Workers Scripts → Write
+- `peerbit.org` zone → Workers Routes → Write
+
+It does not need DNS, Pages, R2, KV, billing, or token-management access.
+
+Rollback is a revert on `master`, which redeploys the prior atomic asset version.
+Cloudflare deployment rollback remains available for an emergency platform-side
+rollback.
+
+## Production monitoring
+
+`Monitor bootstrap production` runs every 15 minutes and can also be dispatched manually. It
+does not receive deployment credentials. It compares the public files with the
+repository and probes every advertised relay for:
+
+- matching public IPv4 answers from Google and Cloudflare DNS;
+- strict TLS on the peer API and at least 14 days of certificate validity;
+- the exact advertised peer ID; and
+- a valid WebSocket upgrade and accept hash on port 4003.
+
+## Relay provisioning
+
+Automated relay provisioning is temporarily disabled. The previous workflow
+depended on the retired AWS-backed test-domain service, exported the administration
+API port instead of the relay multiaddr, and launched Peerbit outside a service
+manager.
+
+Existing nodes must be recovered in place without deleting or resetting
+`/root/.peerbit`. Re-enable provisioning only after the Cloudflare DNS and
+systemd-supervised implementation has been released and validated. A node must not
+be added to a bootstrap file until DNS, strict TLS, exact peer identity, public WSS,
+a real libp2p dial/reservation, service enablement, and restart recovery all pass.
 
 ## Rolling self-update workflow
 
-This repo contains a manual GitHub Actions workflow:
-
-- `Rolling Bootstrap Self-Update`
-
-It performs rolling updates of the bootstrap fleet using each node's remote
-`self-update` API with preflight health checks and batch-by-batch rollout.
-
-If a batch fails, the workflow can automatically roll back updated nodes to
-their per-node previous `@peerbit/server` version.
+`Rolling Bootstrap Self-Update` performs rolling updates of the advertised fleet
+through each node's remote `self-update` API, with preflight health checks and
+batch-by-batch rollout. If a batch fails, it can roll updated nodes back to their
+per-node previous `@peerbit/server` version.
 
 ## PR-driven bootstrap rollouts
 
-This repo also supports a tracked rollout manifest:
+Changing `rollouts/bootstrap-5.json` on `master` triggers `Deploy Bootstrap Rollout`.
+That workflow calls the reusable rolling-update workflow, keeping production
+rollouts behind normal review. Nodes already on the requested version are skipped.
 
-- `rollouts/bootstrap-5.json`
-
-Merging a PR that changes that file on `master` triggers:
-
-- `Deploy Bootstrap Rollout`
-
-That workflow reads the manifest and then calls the reusable
-`Rolling Bootstrap Self-Update` workflow. This keeps production rollout behind
-a normal PR review while avoiding manual workflow dispatch for routine server
-updates.
-
-The deploy script skips nodes that are already on the requested
-`@peerbit/server` version, so rerunning or merging a no-op rollout does not
-force an unnecessary restart.
-
-If a node's public WebSocket is already unhealthy, the rollout logs that
-preflight failure as a warning and still attempts `self-update`; the public
-WebSocket check remains required after update and rollback.
-
-### Required secret
-
-Configure this repository secret in the `production` environment:
-
-- `PEERBIT_ADMIN_KEY_B64`: base64-encoded serialized Peerbit admin keypair
-  that is trusted by bootstrap nodes.
-
-### Typical run settings
-
-- `target_version`: release version to deploy (for example `5.10.14`)
-- `bootstrap_file`: `bootstrap-4.env` or `bootstrap-5.env`
-- `batch_size`: `1` for safest rolling update
-- `rollback_on_failure`: `true`
+The rolling workflows require the production environment secret
+`PEERBIT_ADMIN_KEY_B64`, containing the base64-encoded serialized Peerbit admin
+keypair trusted by the bootstrap nodes.

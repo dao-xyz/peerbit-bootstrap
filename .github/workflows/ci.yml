@@ -1,31 +1,101 @@
-name: Upload Website
+name: Validate and deploy bootstrap config
 
 on:
+  pull_request:
+    paths:
+      - "bootstrap-*.env"
+      - "static/**"
+      - "scripts/**"
+      - "package*.json"
+      - "tools/wrangler/**"
+      - "wrangler.jsonc"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/monitor.yml"
   push:
     branches:
-    - master
+      - master
+    paths:
+      - "bootstrap-*.env"
+      - "static/**"
+      - "scripts/**"
+      - "package*.json"
+      - "tools/wrangler/**"
+      - "wrangler.jsonc"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/monitor.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bootstrap-config-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  deploy:
-    runs-on: ubuntu-latest
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
-    - name: Checkout
-      uses: actions/checkout@v1
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v1
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: us-east-1
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.x
 
-    - name: Build
-      run: |
-        mkdir -p dist
-        cp -r bootstrap-*.env dist/
+      - name: Validate and build assets
+        run: node scripts/build-bootstrap.mjs
 
+      - name: Validate operational scripts
+        run: |
+          node --check scripts/verify-public.mjs
+          node --check scripts/monitor-relays.mjs
 
-    - name: Deploy bootstrap config
-      run: |
-            aws s3 sync ./dist s3://bootstrap-peerbit-org-dist --delete
-            aws cloudfront create-invalidation --distribution-id E2KENBK8QJA0JV --paths '/*';
+      - name: Install locked Wrangler toolchain
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix tools/wrangler
+
+      - name: Validate Worker bundle
+        run: tools/wrangler/node_modules/.bin/wrangler deploy --dry-run --outdir .wrangler-dry-run
+
+  deploy:
+    if: github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.x
+
+      - name: Validate and build assets
+        run: node scripts/build-bootstrap.mjs
+
+      - name: Verify relays before publishing
+        run: node scripts/monitor-relays.mjs
+
+      - name: Install locked Wrangler toolchain
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix tools/wrangler
+
+      - name: Deploy to Cloudflare
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: tools/wrangler/node_modules/.bin/wrangler deploy
+
+      - name: Verify production bytes, headers, and TLS
+        run: >-
+          node scripts/verify-public.mjs
+          --base-url https://bootstrap.peerbit.org
+          --attempts 60
+          --delay-ms 5000

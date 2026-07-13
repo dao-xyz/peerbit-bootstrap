@@ -3,6 +3,9 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "build": "node scripts/build-bootstrap.mjs",
+    "monitor": "node scripts/monitor-relays.mjs",
+    "verify:public": "node scripts/verify-public.mjs",
     "rolling-self-update": "node scripts/rolling-self-update.mjs"
   },
   "dependencies": {
