@@ -89,6 +89,21 @@ Changing `rollouts/bootstrap-5.json` on `master` triggers `Deploy Bootstrap Roll
 That workflow calls the reusable rolling-update workflow, keeping production
 rollouts behind normal review. Nodes already on the requested version are skipped.
 
-The rolling workflows require the production environment secret
+The signed-request v1 to v2 migration uses exact, lockfile-pinned v6 and v8 admin
+clients. The legacy client verifies the reviewed source fingerprint and only
+initiates the update. A fresh v8 client then pins the peer ID from the bootstrap
+multiaddr, verifies the signed authentication descriptor, and checks the complete
+target dependency fingerprint. A failed transition performs a protocol-aware
+rollback to the explicit reviewed version and treats an unverifiable rollback as
+fatal.
+
+The rollout configuration also pins the npm SHA-512 integrity for both server
+versions. CI validates the config, lockfile, package metadata, state-machine tests,
+and high/critical dependency audit before the production job can access its secret.
+The temporary v6 client alias should be removed after the v8 rollout has completed
+and been independently verified.
+
+Rollouts run only from a reviewed `master` push; direct arbitrary-version dispatch
+and broad secret inheritance are disabled. The production environment provides
 `PEERBIT_ADMIN_KEY_B64`, containing the base64-encoded serialized Peerbit admin
 keypair trusted by the bootstrap nodes.

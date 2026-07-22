@@ -3,406 +3,770 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import https from "node:https";
+import net from "node:net";
 import path from "node:path";
-import { deserialize } from "@dao-xyz/borsh";
-import { Ed25519Keypair } from "@peerbit/crypto";
-import { createClient } from "@peerbit/server";
+import { pathToFileURL } from "node:url";
+import {
+  readAndValidateRolloutConfig,
+  rolloutConfigOutput,
+} from "./rollout-config.mjs";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const parseArgs = (argv) => {
+export class RolloutInvariantError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "RolloutInvariantError";
+  }
+}
+
+const ensure = (condition, message, ErrorType = Error) => {
+  if (!condition) throw new ErrorType(message);
+};
+
+const isPlainObject = (value) =>
+  value !== null &&
+  typeof value === "object" &&
+  !Array.isArray(value) &&
+  Object.getPrototypeOf(value) === Object.prototype;
+
+const sanitizeErrorText = (value) => {
+  const singleLine = String(value ?? "unknown")
+    .replace(/[\r\n\t\0]+/g, " ")
+    .replace(
+      /(["']?)(x-peerbit-(?:signature(?:-time)?|timestamp)|authorization|peerbit_admin_key_b64)\1\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;}\]]+)/gi,
+      "$2=[redacted]",
+    )
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .trim();
+  return singleLine.length > 500 ? `${singleLine.slice(0, 497)}...` : singleLine;
+};
+
+const safeErrorName = (error) => {
+  const name = typeof error?.name === "string" ? error.name : "Error";
+  return /^[A-Za-z][A-Za-z0-9]{0,63}$/.test(name) ? name : "Error";
+};
+
+export const formatErrorSummary = (error, depth = 0) => {
+  if (depth >= 3) return "Error: nested failure omitted";
+  const name = safeErrorName(error);
+  const message = sanitizeErrorText(error?.message ?? error);
+  let summary = `${name}: ${message}`;
+  if (error instanceof AggregateError) {
+    const nested = [...error.errors]
+      .slice(0, 8)
+      .map((item) => formatErrorSummary(item, depth + 1));
+    if (nested.length > 0) summary += ` [${nested.join(" | ")}]`;
+  }
+  return sanitizeErrorText(summary);
+};
+
+export const toSafeError = (error) => {
+  if (error instanceof AggregateError) {
+    return new AggregateError(
+      [...error.errors].slice(0, 8).map((item) => toSafeError(item)),
+      sanitizeErrorText(error.message),
+    );
+  }
+  if (error instanceof RolloutInvariantError) {
+    return new RolloutInvariantError(sanitizeErrorText(error.message));
+  }
+  return new Error(formatErrorSummary(error));
+};
+
+export const withTimeout = async (operation, timeoutMs, description) => {
+  ensure(Number.isFinite(timeoutMs) && timeoutMs > 0, `${description} timeout must be positive`);
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${description} timed out after ${Math.ceil(timeoutMs)}ms`)),
+      timeoutMs,
+    );
+  });
+  try {
+    return await Promise.race([Promise.resolve().then(operation), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+export const parseArgs = (argv) => {
+  const allowed = new Set(["config-file", "validate-config"]);
   const result = {};
-  for (let i = 2; i < argv.length; i++) {
-    const token = argv[i];
-    if (!token?.startsWith("--")) continue;
+  for (let index = 2; index < argv.length; index += 1) {
+    const token = argv[index];
+    ensure(token?.startsWith("--"), `Unexpected positional argument: ${token}`);
     const key = token.slice(2);
-    const next = argv[i + 1];
-    if (!next || next.startsWith("--")) {
-      result[key] = "true";
+    ensure(allowed.has(key), `Unknown argument: --${key}`);
+    ensure(result[key] === undefined, `Duplicate argument: --${key}`);
+    if (key === "validate-config") {
+      result[key] = true;
       continue;
     }
-    result[key] = next;
-    i += 1;
+    const value = argv[index + 1];
+    ensure(value && !value.startsWith("--"), `Missing value for --${key}`);
+    result[key] = value;
+    index += 1;
   }
   return result;
 };
 
-const readConfigFile = (configFile) => {
-  const file = path.resolve(process.cwd(), configFile);
-  ensure(fs.existsSync(file), `Missing config file: ${file}`);
-  const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
-  ensure(parsed && typeof parsed === "object", `Invalid config file: ${file}`);
-  return parsed;
+const parseHost = (type, value, label) => {
+  if (type === "ip4") {
+    ensure(net.isIP(value) === 4, `${label} has an invalid IPv4 address`);
+  } else if (type === "ip6") {
+    ensure(net.isIP(value) === 6, `${label} has an invalid IPv6 address`);
+  } else {
+    ensure(
+      value.length <= 253 &&
+        value.split(".").every(
+          (part) =>
+            part.length >= 1 &&
+            part.length <= 63 &&
+            /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(part),
+        ),
+      `${label} has an invalid DNS name`,
+    );
+  }
 };
 
-const ensure = (condition, message) => {
-  if (!condition) throw new Error(message);
-};
-
-const readBootstrapRemotes = (bootstrapFile) => {
-  const file = path.resolve(process.cwd(), bootstrapFile);
-  ensure(fs.existsSync(file), `Missing bootstrap file: ${file}`);
-  const lines = fs
-    .readFileSync(file, "utf8")
+export const parseBootstrapRemotes = (contents, label = "bootstrap file") => {
+  ensure(typeof contents === "string", `${label} contents must be text`);
+  const lines = contents
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line.length > 0 && !line.startsWith("#"));
+  ensure(lines.length > 0, `No bootstrap remotes found in ${label}`);
 
-  const seen = new Set();
-  const remotes = [];
-  for (const line of lines) {
-    const match = line.match(/\/(dns4|dns6|ip4|ip6)\/([^/]+)/);
-    if (!match) continue;
-    const hostType = match[1];
-    const host = match[2];
-    const key = `${hostType}:${host}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
+  const remoteKeys = new Set();
+  const peerIds = new Set();
+  const remotes = lines.map((line, index) => {
+    const lineLabel = `${label}:${index + 1}`;
+    ensure(line.startsWith("/") && !/\s/.test(line), `${lineLabel} must be one multiaddr`);
+    const segments = line.slice(1).split("/");
+    ensure(segments.every((segment) => segment.length > 0), `${lineLabel} has an empty segment`);
+    const p2pIndexes = segments
+      .map((segment, segmentIndex) => (segment === "p2p" ? segmentIndex : -1))
+      .filter((segmentIndex) => segmentIndex >= 0);
+    ensure(p2pIndexes.length === 1, `${lineLabel} must contain exactly one /p2p/<peer-id>`);
+    const p2pIndex = p2pIndexes[0];
+    ensure(p2pIndex === segments.length - 2, `${lineLabel} must end with /p2p/<peer-id>`);
+    ensure(
+      segments.length === 7,
+      `${lineLabel} must use /<host-protocol>/<host>/tcp/<port>/<ws|wss>/p2p/<peer-id>`,
+    );
+    const peerId = segments[p2pIndex + 1];
+    ensure(
+      /^[A-Za-z0-9]{20,128}$/.test(peerId),
+      `${lineLabel} contains an invalid peer ID`,
+    );
+
+    const hostIndexes = segments
+      .map((segment, segmentIndex) =>
+        ["dns4", "dns6", "ip4", "ip6"].includes(segment) ? segmentIndex : -1,
+      )
+      .filter((segmentIndex) => segmentIndex >= 0);
+    ensure(hostIndexes.length === 1, `${lineLabel} must contain exactly one host protocol`);
+    const hostIndex = hostIndexes[0];
+    ensure(hostIndex === 0, `${lineLabel} must begin with its host protocol`);
+    ensure(hostIndex + 1 < segments.length, `${lineLabel} is missing its host`);
+    const hostType = segments[hostIndex];
+    const host = segments[hostIndex + 1];
+    parseHost(hostType, host, lineLabel);
+
+    const tcpIndexes = segments
+      .map((segment, segmentIndex) => (segment === "tcp" ? segmentIndex : -1))
+      .filter((segmentIndex) => segmentIndex >= 0);
+    ensure(tcpIndexes.length === 1, `${lineLabel} must contain exactly one /tcp/<port>`);
+    const tcpIndex = tcpIndexes[0];
+    ensure(tcpIndex === 2, `${lineLabel} must place /tcp/<port> immediately after its host`);
+    ensure(tcpIndex + 2 < segments.length, `${lineLabel} is missing its TCP transport`);
+    const portText = segments[tcpIndex + 1];
+    ensure(/^[1-9]\d{0,4}$/.test(portText), `${lineLabel} has an invalid TCP port`);
+    const port = Number(portText);
+    ensure(port <= 65_535, `${lineLabel} has an invalid TCP port`);
+    const transport = segments[tcpIndex + 2];
+    ensure(transport === "ws" || transport === "wss", `${lineLabel} must use ws or wss`);
+
+    const remoteKey = `${hostType}:${host}`;
+    ensure(!remoteKeys.has(remoteKey), `${lineLabel} duplicates remote host ${host}`);
+    ensure(!peerIds.has(peerId), `${lineLabel} duplicates peer ID ${peerId}`);
+    remoteKeys.add(remoteKey);
+    peerIds.add(peerId);
 
     const protocol = hostType.startsWith("ip") ? "http" : "https";
-    const wsMatch = line.match(/\/tcp\/(\d+)\/(ws|wss)(?:\/|$)/);
-    const wsHost = hostType === "ip6" || host.includes(":") ? `[${host}]` : host;
-    const publicWebSocketAddress = wsMatch
-      ? `${wsMatch[2] === "wss" ? "https" : "http"}://${wsHost}:${wsMatch[1]}/`
-      : undefined;
-    remotes.push({
-      name: `bootstrap-${remotes.length + 1}`,
+    const urlHost = hostType === "ip6" ? `[${host}]` : host;
+    return Object.freeze({
+      name: `bootstrap-${index + 1}`,
       host,
-      address: `${protocol}://${host}`,
-      publicWebSocketAddress,
+      address: `${protocol}://${urlHost}`,
+      publicWebSocketAddress: `${transport === "wss" ? "https" : "http"}://${urlHost}:${port}/`,
+      peerId,
+      multiaddr: line,
     });
-  }
-  ensure(remotes.length > 0, `No remotes resolved from ${bootstrapFile}`);
-  return remotes;
+  });
+  return Object.freeze(remotes);
 };
 
-const decodeKeypair = () => {
-  const b64 = process.env.PEERBIT_ADMIN_KEY_B64;
+export const readBootstrapRemotes = (bootstrapPath) =>
+  parseBootstrapRemotes(fs.readFileSync(bootstrapPath, "utf8"), bootstrapPath);
+
+export const assertWebSocketUpgrade = (response, requestKey) => {
+  ensure(response?.statusCode === 101, `expected HTTP 101, got ${response?.statusCode ?? "unknown"}`);
+  const upgrade = response.headers?.upgrade;
   ensure(
-    typeof b64 === "string" && b64.length > 0,
-    "Missing PEERBIT_ADMIN_KEY_B64 environment variable",
+    typeof upgrade === "string" && upgrade.toLowerCase() === "websocket",
+    "WebSocket upgrade header is missing",
   );
-  const bytes = Buffer.from(b64, "base64");
-  return deserialize(bytes, Ed25519Keypair);
-};
-
-const waitForReady = async (api, remote, timeoutMs, delayMs) => {
-  const start = Date.now();
-  let lastError;
-  while (Date.now() - start < timeoutMs) {
-    try {
-      await api.peer.id.get();
-      return;
-    } catch (error) {
-      lastError = error;
-      await sleep(delayMs);
-    }
-  }
-  throw new Error(
-    `Timed out waiting for ${remote.name} (${remote.address}) to become ready. Last error: ${
-      lastError?.message || lastError || "unknown"
-    }`,
-  );
+  const connection = response.headers?.connection;
+  ensure(typeof connection === "string", "WebSocket connection header is missing");
+  const connectionTokens = connection
+    .toLowerCase()
+    .split(",")
+    .map((token) => token.trim());
+  ensure(connectionTokens.includes("upgrade"), "WebSocket connection upgrade token is missing");
+  const expectedAccept = crypto
+    .createHash("sha1")
+    .update(`${requestKey}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`, "ascii")
+    .digest("base64");
+  ensure(response.headers?.["sec-websocket-accept"] === expectedAccept, "WebSocket accept hash mismatch");
 };
 
 const probePublicWebSocket = async (remote) => {
-  if (!remote.publicWebSocketAddress) return;
-
   await new Promise((resolve, reject) => {
     const url = new URL(remote.publicWebSocketAddress);
     const client = url.protocol === "https:" ? https : http;
-    const req = client.request(url, {
+    const requestKey = crypto.randomBytes(16).toString("base64");
+    const request = client.request(url, {
       method: "GET",
       headers: {
         Connection: "Upgrade",
         Upgrade: "websocket",
         "Sec-WebSocket-Version": "13",
-        "Sec-WebSocket-Key": crypto.randomBytes(16).toString("base64"),
+        "Sec-WebSocket-Key": requestKey,
       },
     });
-
-    req.setTimeout(10_000, () => {
-      req.destroy(new Error("public WebSocket probe timed out"));
-    });
-
-    req.on("upgrade", (res, socket) => {
+    request.setTimeout(10_000, () => request.destroy(new Error("public WebSocket probe timed out")));
+    request.on("upgrade", (response, socket) => {
       socket.destroy();
-      if (res.statusCode === 101) {
+      try {
+        assertWebSocketUpgrade(response, requestKey);
         resolve();
-        return;
+      } catch (error) {
+        reject(error);
       }
-      reject(new Error(`expected HTTP 101, got ${res.statusCode ?? "unknown"}`));
     });
-
-    req.on("response", (res) => {
-      res.resume();
-      reject(new Error(`expected HTTP 101, got ${res.statusCode ?? "unknown"}`));
+    request.on("response", (response) => {
+      response.resume();
+      reject(new Error(`expected HTTP 101, got ${response.statusCode ?? "unknown"}`));
     });
-
-    req.on("error", reject);
-    req.end();
+    request.on("error", reject);
+    request.end();
   });
 };
 
-const waitForPublicWebSocket = async (remote, timeoutMs, delayMs) => {
-  if (!remote.publicWebSocketAddress) return;
-
-  const start = Date.now();
+const retry = async ({ operation, timeoutMs, delayMs, description, sleepImpl = sleep }) => {
+  const deadline = Date.now() + timeoutMs;
   let lastError;
-  while (Date.now() - start < timeoutMs) {
+  do {
     try {
-      await probePublicWebSocket(remote);
-      return;
+      const remainingMs = Math.max(1, deadline - Date.now());
+      return await withTimeout(operation, remainingMs, `${description} attempt`);
     } catch (error) {
-      lastError = error;
-      await sleep(delayMs);
+      if (error instanceof RolloutInvariantError) throw error;
+      lastError = toSafeError(error);
+      if (Date.now() >= deadline) break;
+      await sleepImpl(Math.min(delayMs, Math.max(0, deadline - Date.now())));
     }
-  }
-
+  } while (Date.now() < deadline);
   throw new Error(
-    `Timed out waiting for ${remote.name} (${remote.publicWebSocketAddress}) public WebSocket. Last error: ${
-      lastError?.message || lastError || "unknown"
-    }`,
+    `Timed out waiting for ${description}. Last error: ${formatErrorSummary(lastError)}`,
   );
 };
 
-const getVersionInfo = async (api) => {
+export const waitForPublicWebSocket = async (
+  remote,
+  timeoutMs,
+  delayMs,
+  { sleepImpl = sleep } = {},
+) =>
+  retry({
+    operation: () => probePublicWebSocket(remote),
+    timeoutMs,
+    delayMs,
+    description: `${remote.name} (${remote.publicWebSocketAddress}) public WebSocket`,
+    sleepImpl,
+  });
+
+const createPinnedV8 = (createV8Client, keypair, remote) =>
+  createV8Client(keypair, { address: remote.address, peerId: remote.peerId });
+
+const createLegacy = (createLegacyClient, keypair, remote) =>
+  createLegacyClient(keypair, { address: remote.address });
+
+const readClientState = async (api, { verifyDescriptor = false } = {}) => {
+  const firstPeerId = await api.peer.id.get();
+  const descriptorPeerId = verifyDescriptor ? await api.peer.id.verify() : undefined;
   const versions = await api.dependency.versions();
-  const serverVersion =
-    typeof versions["@peerbit/server"] === "string" && versions["@peerbit/server"].length > 0
-      ? versions["@peerbit/server"]
-      : undefined;
-  const peerbitVersion =
-    typeof versions["peerbit"] === "string" && versions["peerbit"].length > 0
-      ? versions["peerbit"]
-      : undefined;
-  return { versions, serverVersion, peerbitVersion };
-};
-
-const waitForVersionInfo = async (api, remote, timeoutMs, delayMs) => {
-  const start = Date.now();
-  let lastError;
-  while (Date.now() - start < timeoutMs) {
-    try {
-      return await getVersionInfo(api);
-    } catch (error) {
-      lastError = error;
-      await sleep(delayMs);
-    }
-  }
-  throw new Error(
-    `Timed out waiting for ${remote.name} (${remote.address}) version endpoint to recover. Last error: ${
-      lastError?.message || lastError || "unknown"
-    }`,
-  );
-};
-
-const describeVersion = (info) => {
-  if (info.serverVersion) return `@peerbit/server@${info.serverVersion}`;
-  if (info.peerbitVersion) return `peerbit@${info.peerbitVersion}`;
-  const keys = Object.keys(info.versions || {});
-  return keys.length > 0 ? `unknown-key(${keys.join(",")})` : "unknown";
-};
-
-const chunk = (arr, size) => {
-  const out = [];
-  for (let i = 0; i < arr.length; i += size) {
-    out.push(arr.slice(i, i + size));
-  }
-  return out;
-};
-
-const run = async () => {
-  const args = parseArgs(process.argv);
-  const config = args["config-file"] ? readConfigFile(args["config-file"]) : {};
-  const bootstrapFile = args["bootstrap-file"] || config.bootstrapFile || "bootstrap-4.env";
-  const targetVersion = args["target-version"] || config.targetVersion;
-  const batchSize = Math.max(1, Number(args["batch-size"] || config.batchSize || "1"));
-  const waitReadyTimeoutMs = Math.max(
-    1_000,
-    Number(args["wait-ready-timeout-ms"] || config.waitReadyTimeoutMs || "180000"),
-  );
-  const waitReadyDelayMs = Math.max(
-    200,
-    Number(args["wait-ready-delay-ms"] || config.waitReadyDelayMs || "3000"),
-  );
-  const rollbackOnFailure =
-    String(args["rollback-on-failure"] ?? config.rollbackOnFailure ?? "true") === "true";
-
+  const secondPeerId = await api.peer.id.get();
   ensure(
-    typeof targetVersion === "string" && targetVersion.length > 0,
-    "Missing --target-version",
+    typeof firstPeerId === "string" && typeof secondPeerId === "string",
+    "peer.id.get() must return a string",
+    RolloutInvariantError,
   );
-
-  const keypair = decodeKeypair();
-  const remotes = readBootstrapRemotes(bootstrapFile);
-
-  console.log(`Resolved ${remotes.length} remotes from ${bootstrapFile}`);
-
-  const state = [];
-  for (const remote of remotes) {
-    const api = await createClient(keypair, { address: remote.address });
-    await waitForReady(api, remote, waitReadyTimeoutMs, waitReadyDelayMs);
-    let preflightPublicWebSocketReady = true;
-    try {
-      await waitForPublicWebSocket(remote, waitReadyTimeoutMs, waitReadyDelayMs);
-    } catch (error) {
-      preflightPublicWebSocketReady = false;
-      console.warn(
-        `${remote.name}: public WebSocket preflight failed; continuing because self-update may recover the node. Last error: ${
-          error?.message || error || "unknown"
-        }`,
-      );
-    }
-    const peerId = await api.peer.id.get();
-    const previousVersionInfo = await waitForVersionInfo(
-      api,
-      remote,
-      waitReadyTimeoutMs,
-      waitReadyDelayMs,
+  ensure(
+    firstPeerId === secondPeerId,
+    `peer identity changed during verification (${firstPeerId} -> ${secondPeerId})`,
+    RolloutInvariantError,
+  );
+  if (verifyDescriptor) {
+    ensure(
+      typeof descriptorPeerId === "string",
+      "peer.id.verify() must return the signed descriptor peer ID",
+      RolloutInvariantError,
     );
-    if (!previousVersionInfo.serverVersion) {
-      console.warn(
-        `${remote.name}: @peerbit/server not listed in dependency versions; using fallback visibility (${describeVersion(
-          previousVersionInfo,
-        )})`,
-      );
-    }
-    console.log(
-      `${remote.name}: preflight ready (peerId=${peerId}, version=${describeVersion(
-        previousVersionInfo,
-      )})`,
+  }
+  ensure(isPlainObject(versions), "dependency.versions() must return an object", RolloutInvariantError);
+  return { peerId: firstPeerId, descriptorPeerId, versions };
+};
+
+const assertIdentity = (state, remote, phase) => {
+  ensure(
+    state.peerId === remote.peerId,
+    `${remote.name}: ${phase} peer ID mismatch: expected ${remote.peerId}, got ${state.peerId}`,
+    RolloutInvariantError,
+  );
+  if (state.descriptorPeerId !== undefined) {
+    ensure(
+      state.descriptorPeerId === remote.peerId,
+      `${remote.name}: ${phase} signed descriptor peer ID mismatch: expected ${remote.peerId}, got ${state.descriptorPeerId}`,
+      RolloutInvariantError,
     );
-    state.push({
-      remote,
-      previousVersion: previousVersionInfo.serverVersion,
-      previousVersionInfo,
-      preflightPublicWebSocketReady,
-    });
+  }
+};
+
+export const assertDependencyFingerprint = (
+  state,
+  expectedServerVersion,
+  expectedFingerprint,
+  label,
+) => {
+  assertOptionalServerVersion(state, expectedServerVersion, label);
+  const mismatches = Object.entries(expectedFingerprint)
+    .filter(([dependency, version]) => state.versions[dependency] !== version)
+    .map(
+      ([dependency, version]) =>
+        `${dependency}: expected ${version}, got ${state.versions[dependency] ?? "missing"}`,
+    );
+  ensure(
+    mismatches.length === 0,
+    `${label}: dependency fingerprint mismatch (${mismatches.join("; ")})`,
+    RolloutInvariantError,
+  );
+};
+
+const assertOptionalServerVersion = (state, expectedServerVersion, label) => {
+  if (Object.hasOwn(state.versions, "@peerbit/server")) {
+    ensure(
+      state.versions["@peerbit/server"] === expectedServerVersion,
+      `${label}: expected @peerbit/server@${expectedServerVersion}, got ${state.versions["@peerbit/server"]}`,
+      RolloutInvariantError,
+    );
+  }
+};
+
+export const assertSelfUpdateResponse = (response, expectedVersion, label) => {
+  ensure(isPlainObject(response), `${label}: selfUpdate response must be an object`, RolloutInvariantError);
+  const keys = Object.keys(response);
+  ensure(
+    keys.length === 1 && keys[0] === "version" && response.version === expectedVersion,
+    `${label}: selfUpdate must return exactly {"version":"${expectedVersion}"}`,
+    RolloutInvariantError,
+  );
+};
+
+const readFreshV8State = async ({ createV8Client, keypair, remote }) => {
+  const api = await createPinnedV8(createV8Client, keypair, remote);
+  return { api, state: await readClientState(api, { verifyDescriptor: true }) };
+};
+
+const readFreshLegacyState = async ({ createLegacyClient, keypair, remote }) => {
+  const api = await createLegacy(createLegacyClient, keypair, remote);
+  return { api, state: await readClientState(api) };
+};
+
+const waitForV8Target = async ({
+  createV8Client,
+  keypair,
+  remote,
+  config,
+  sleepImpl,
+}) =>
+  retry({
+    operation: async () => {
+      const result = await readFreshV8State({ createV8Client, keypair, remote });
+      assertIdentity(result.state, remote, "v8 postcheck");
+      assertDependencyFingerprint(
+        result.state,
+        config.targetVersion,
+        config.targetFingerprint,
+        `${remote.name} v8 postcheck`,
+      );
+      return result;
+    },
+    timeoutMs: config.waitReadyTimeoutMs,
+    delayMs: config.waitReadyDelayMs,
+    description: `${remote.name} fresh authenticated v8 client`,
+    sleepImpl,
+  });
+
+const waitForLegacyRollback = async ({
+  createLegacyClient,
+  keypair,
+  remote,
+  config,
+  sleepImpl,
+}) =>
+  retry({
+    operation: async () => {
+      const result = await readFreshLegacyState({ createLegacyClient, keypair, remote });
+      assertIdentity(result.state, remote, "legacy rollback postcheck");
+      assertDependencyFingerprint(
+        result.state,
+        config.rollbackVersion,
+        config.rollbackFingerprint,
+        `${remote.name} legacy rollback postcheck`,
+      );
+      return result;
+    },
+    timeoutMs: config.waitReadyTimeoutMs,
+    delayMs: config.waitReadyDelayMs,
+    description: `${remote.name} legacy rollback postcheck`,
+    sleepImpl,
+  });
+
+const preflightRemoteOnce = async ({ createV8Client, createLegacyClient, keypair, remote, config }) => {
+  let v8Error;
+  try {
+    const result = await readFreshV8State({ createV8Client, keypair, remote });
+    assertIdentity(result.state, remote, "v8 preflight");
+    assertDependencyFingerprint(
+      result.state,
+      config.targetVersion,
+      config.targetFingerprint,
+      `${remote.name} v8 preflight`,
+    );
+    return { protocol: "v8", ...result };
+  } catch (error) {
+    if (error instanceof RolloutInvariantError) throw error;
+    v8Error = toSafeError(error);
   }
 
-  const updated = [];
-  const batches = chunk(state, batchSize);
+  try {
+    const result = await readFreshLegacyState({ createLegacyClient, keypair, remote });
+    assertIdentity(result.state, remote, "legacy preflight");
+    assertDependencyFingerprint(
+      result.state,
+      config.expectedCurrentVersion,
+      config.rollbackFingerprint,
+      `${remote.name} legacy preflight`,
+    );
+    return { protocol: "legacy", ...result };
+  } catch (legacyError) {
+    if (legacyError instanceof RolloutInvariantError) throw legacyError;
+    throw new AggregateError(
+      [v8Error, toSafeError(legacyError)],
+      `${remote.name}: neither pinned v8 nor legacy protocol was reachable`,
+    );
+  }
+};
 
-  const rollback = async (targets) => {
-    if (!rollbackOnFailure) return;
-    console.log(`Starting rollback for ${targets.length} node(s)`);
-    for (const item of targets) {
+const preflightRemote = ({ createV8Client, createLegacyClient, keypair, remote, config, sleepImpl }) =>
+  retry({
+    operation: () =>
+      preflightRemoteOnce({ createV8Client, createLegacyClient, keypair, remote, config }),
+    timeoutMs: config.waitReadyTimeoutMs,
+    delayMs: config.waitReadyDelayMs,
+    description: `${remote.name} protocol-aware preflight`,
+    sleepImpl,
+  });
+
+const chunk = (items, size) => {
+  const result = [];
+  for (let index = 0; index < items.length; index += size) result.push(items.slice(index, index + size));
+  return result;
+};
+
+const rollbackOne = async ({
+  item,
+  config,
+  keypair,
+  createV8Client,
+  createLegacyClient,
+  waitForPublicWebSocketImpl,
+  sleepImpl,
+  logger,
+}) => {
+  const { remote } = item;
+  const detected = await retry({
+    operation: async () => {
+      let v8Error;
       try {
-        if (!item.previousVersion) {
-          console.warn(
-            `${item.remote.name}: skipping rollback because previous @peerbit/server version is unknown`,
-          );
-          continue;
-        }
-        const api = await createClient(keypair, { address: item.remote.address });
-        await api.selfUpdate(item.previousVersion);
-        await waitForReady(api, item.remote, waitReadyTimeoutMs, waitReadyDelayMs);
-        await waitForPublicWebSocket(
-          item.remote,
-          waitReadyTimeoutMs,
-          waitReadyDelayMs,
+        const result = await readFreshV8State({ createV8Client, keypair, remote });
+        assertIdentity(result.state, remote, "v8 rollback preflight");
+        // A fingerprint mismatch may be the reason for rollback. The pinned v8
+        // descriptor and exact peer ID authorize recovery; an advertised server
+        // version, when present, must still be the reviewed target.
+        assertOptionalServerVersion(
+          result.state,
+          config.targetVersion,
+          `${remote.name} v8 rollback preflight`,
         );
-        const versionInfoAfter = await waitForVersionInfo(
-          api,
-          item.remote,
-          waitReadyTimeoutMs,
-          waitReadyDelayMs,
+        return { protocol: "v8", ...result };
+      } catch (error) {
+        if (error instanceof RolloutInvariantError) throw error;
+        v8Error = toSafeError(error);
+      }
+
+      try {
+        const result = await readFreshLegacyState({ createLegacyClient, keypair, remote });
+        assertIdentity(result.state, remote, "rollback legacy detection");
+        assertDependencyFingerprint(
+          result.state,
+          config.rollbackVersion,
+          config.rollbackFingerprint,
+          `${remote.name} rollback legacy detection`,
         );
-        if (versionInfoAfter.serverVersion !== item.previousVersion) {
+        if (item.forwardPhase !== "not-called") {
           throw new Error(
-            `rollback version mismatch: expected ${item.previousVersion}, got ${describeVersion(
-              versionInfoAfter,
-            )}`,
+            `${remote.name}: forward selfUpdate is ${item.forwardPhase}; legacy state is ambiguous until pinned v8 is observed`,
           );
         }
-        console.log(
-          `${item.remote.name}: rollback complete -> ${describeVersion(versionInfoAfter)}`,
+        return { protocol: "legacy", ...result };
+      } catch (legacyError) {
+        if (legacyError instanceof RolloutInvariantError) throw legacyError;
+        throw new AggregateError(
+          [v8Error, toSafeError(legacyError)],
+          `${remote.name}: rollback could not identify either supported protocol`,
+        );
+      }
+    },
+    timeoutMs: config.waitReadyTimeoutMs,
+    delayMs: config.waitReadyDelayMs,
+    description: `${remote.name} rollback protocol detection`,
+    sleepImpl,
+  });
+
+  if (detected.protocol === "v8") {
+    const response = await withTimeout(
+      () => detected.api.selfUpdate(config.rollbackVersion),
+      config.waitReadyTimeoutMs,
+      `${remote.name} rollback selfUpdate`,
+    );
+    assertSelfUpdateResponse(response, config.rollbackVersion, `${remote.name} rollback`);
+  } else {
+    logger.log(`${remote.name}: forward call was not invoked; reviewed legacy state is unchanged`);
+  }
+
+  await waitForLegacyRollback({ createLegacyClient, keypair, remote, config, sleepImpl });
+  await waitForPublicWebSocketImpl(remote, config.waitReadyTimeoutMs, config.waitReadyDelayMs, {
+    sleepImpl,
+  });
+  logger.log(`${remote.name}: rollback verified -> @peerbit/server@${config.rollbackVersion}`);
+};
+
+export const runRollingSelfUpdate = async ({
+  config,
+  remotes,
+  keypair,
+  createV8Client,
+  createLegacyClient,
+  waitForPublicWebSocketImpl = waitForPublicWebSocket,
+  sleepImpl = sleep,
+  logger = console,
+}) => {
+  ensure(config && typeof config === "object", "config is required");
+  ensure(Array.isArray(remotes) && remotes.length > 0, "at least one remote is required");
+  ensure(typeof createV8Client === "function", "createV8Client is required");
+  ensure(typeof createLegacyClient === "function", "createLegacyClient is required");
+
+  logger.log(`Resolved ${remotes.length} remotes from ${config.bootstrapFile}`);
+  const preflight = [];
+  for (const remote of remotes) {
+    const result = await preflightRemote({
+      createV8Client,
+      createLegacyClient,
+      keypair,
+      remote,
+      config,
+      sleepImpl,
+    });
+    if (result.protocol === "v8") {
+      await waitForPublicWebSocketImpl(
+        remote,
+        config.waitReadyTimeoutMs,
+        config.waitReadyDelayMs,
+        { sleepImpl },
+      );
+      logger.log(`${remote.name}: already on verified @peerbit/server@${config.targetVersion}`);
+    } else {
+      try {
+        await waitForPublicWebSocketImpl(
+          remote,
+          config.waitReadyTimeoutMs,
+          config.waitReadyDelayMs,
+          { sleepImpl },
         );
       } catch (error) {
-        console.error(`${item.remote.name}: rollback failed`, error);
+        logger.warn(
+          `${remote.name}: source public WebSocket preflight failed; target postcheck remains mandatory: ${
+            formatErrorSummary(toSafeError(error))
+          }`,
+        );
       }
+      logger.log(`${remote.name}: verified legacy source @peerbit/server@${config.expectedCurrentVersion}`);
     }
-  };
+    preflight.push({ remote, protocol: result.protocol, forwardPhase: "not-called" });
+  }
 
-  for (let i = 0; i < batches.length; i++) {
-    const batch = batches[i];
-    console.log(`Updating batch ${i + 1}/${batches.length} (${batch.length} node(s))`);
+  const sources = preflight.filter((item) => item.protocol === "legacy");
+  const transitioned = new Set();
+  let completed = 0;
 
+  for (const [batchIndex, batch] of chunk(sources, config.batchSize).entries()) {
+    logger.log(`Updating batch ${batchIndex + 1}/${Math.ceil(sources.length / config.batchSize)}`);
     const settled = await Promise.allSettled(
       batch.map(async (item) => {
-        const needsUpdate =
-          item.previousVersion !== targetVersion ||
-          item.preflightPublicWebSocketReady === false;
-        if (!needsUpdate) {
-          console.log(
-            `${item.remote.name}: already on @peerbit/server@${targetVersion}, skipping update`,
+        try {
+          transitioned.add(item);
+          const api = await createLegacy(createLegacyClient, keypair, item.remote);
+          item.forwardPhase = "ambiguous";
+          const response = await withTimeout(
+            () => api.selfUpdate(config.targetVersion),
+            config.waitReadyTimeoutMs,
+            `${item.remote.name} forward selfUpdate`,
           );
+          assertSelfUpdateResponse(response, config.targetVersion, `${item.remote.name} update`);
+          item.forwardPhase = "acknowledged";
+          await waitForV8Target({
+            createV8Client,
+            keypair,
+            remote: item.remote,
+            config,
+            sleepImpl,
+          });
+          await waitForPublicWebSocketImpl(
+            item.remote,
+            config.waitReadyTimeoutMs,
+            config.waitReadyDelayMs,
+            { sleepImpl },
+          );
+          logger.log(`${item.remote.name}: update verified -> @peerbit/server@${config.targetVersion}`);
           return item;
+        } catch (error) {
+          throw toSafeError(error);
         }
-        if (item.previousVersion === targetVersion) {
-          console.log(
-            `${item.remote.name}: already on @peerbit/server@${targetVersion}, but public WebSocket preflight failed; re-running self-update`,
-          );
-        }
-        const api = await createClient(keypair, { address: item.remote.address });
-        const resp = await api.selfUpdate(targetVersion);
-        await waitForReady(api, item.remote, waitReadyTimeoutMs, waitReadyDelayMs);
-        await waitForPublicWebSocket(
-          item.remote,
-          waitReadyTimeoutMs,
-          waitReadyDelayMs,
-        );
-        const versionInfoAfter = await waitForVersionInfo(
-          api,
-          item.remote,
-          waitReadyTimeoutMs,
-          waitReadyDelayMs,
-        );
-        if (versionInfoAfter.serverVersion) {
-          if (versionInfoAfter.serverVersion !== resp.version) {
-            throw new Error(
-              `version mismatch after update: expected @peerbit/server@${resp.version}, got ${describeVersion(
-                versionInfoAfter,
-              )}`,
-            );
-          }
-        } else {
-          console.warn(
-            `${item.remote.name}: @peerbit/server not listed after update; readiness succeeded with ${describeVersion(
-              versionInfoAfter,
-            )}`,
-          );
-        }
-        console.log(
-          `${item.remote.name}: update complete -> ${describeVersion(versionInfoAfter)}`,
-        );
-        return item;
       }),
     );
 
-    const succeeded = settled
-      .filter((r) => r.status === "fulfilled")
-      .map((r) => r.value);
-    const failed = settled.filter((r) => r.status === "rejected");
+    const failures = settled.filter((result) => result.status === "rejected");
+    completed += settled.length - failures.length;
+    if (failures.length === 0) continue;
 
-    updated.push(...succeeded);
+    const updateErrors = failures.map((failure) => toSafeError(failure.reason));
+    for (const error of updateErrors) {
+      logger.error(`Batch failure: ${formatErrorSummary(error)}`);
+    }
+    if (!config.rollbackOnFailure) {
+      throw new AggregateError(updateErrors, `Rolling update failed in batch ${batchIndex + 1}`);
+    }
 
-    if (failed.length > 0) {
-      for (const failure of failed) {
-        console.error("Batch failure:", failure.reason);
+    const rollbackErrors = [];
+    logger.log(`Starting protocol-aware rollback for ${transitioned.size} node(s)`);
+    for (const item of transitioned) {
+      try {
+        await rollbackOne({
+          item,
+          config,
+          keypair,
+          createV8Client,
+          createLegacyClient,
+          waitForPublicWebSocketImpl,
+          sleepImpl,
+          logger,
+        });
+      } catch (error) {
+        const safeError = toSafeError(error);
+        rollbackErrors.push(safeError);
+        logger.error(
+          `${item.remote.name}: fatal rollback failure: ${formatErrorSummary(safeError)}`,
+        );
       }
-      await rollback([...updated, ...batch.filter((b) => !updated.includes(b))]);
-      throw new Error(
-        `Rolling update failed in batch ${i + 1}. Rolled back updated nodes where possible.`,
+    }
+    if (rollbackErrors.length > 0) {
+      throw new AggregateError(
+        [...updateErrors, ...rollbackErrors],
+        `Rolling update failed in batch ${batchIndex + 1}; ${rollbackErrors.length} rollback(s) failed fatally`,
       );
     }
+    throw new AggregateError(
+      updateErrors,
+      `Rolling update failed in batch ${batchIndex + 1}; all initiated nodes were rolled back and verified`,
+    );
   }
 
-  console.log(`Rolling update succeeded on ${updated.length}/${state.length} nodes.`);
+  logger.log(
+    `Rolling update succeeded: ${completed} transitioned, ${preflight.length - sources.length} already current.`,
+  );
+  return { transitioned: completed, alreadyCurrent: preflight.length - sources.length };
 };
 
-run().catch((error) => {
-  console.error(error);
+const decodeKeypair = async () => {
+  const encoded = process.env.PEERBIT_ADMIN_KEY_B64;
+  ensure(
+    typeof encoded === "string" && encoded.length > 0,
+    "Missing PEERBIT_ADMIN_KEY_B64 environment variable",
+  );
+  const canonical = Buffer.from(encoded, "base64").toString("base64");
+  ensure(canonical === encoded, "PEERBIT_ADMIN_KEY_B64 must be canonical base64");
+  const [{ deserialize }, { Ed25519Keypair }] = await Promise.all([
+    import("@dao-xyz/borsh"),
+    import("@peerbit/crypto"),
+  ]);
+  return deserialize(Buffer.from(encoded, "base64"), Ed25519Keypair);
+};
+
+export const runCli = async (argv = process.argv) => {
+  const args = parseArgs(argv);
+  const config = readAndValidateRolloutConfig({ configFile: args["config-file"] });
+  if (args["validate-config"]) {
+    console.log(JSON.stringify(rolloutConfigOutput(config)));
+    return;
+  }
+
+  const keypair = await decodeKeypair();
+  const [{ createClient: createV8Client }, { createClient: createLegacyClient }] =
+    await Promise.all([import("@peerbit/server"), import("@peerbit/server-legacy")]);
+  const remotes = readBootstrapRemotes(config.bootstrapPath);
+  await runRollingSelfUpdate({
+    config,
+    remotes,
+    keypair,
+    createV8Client,
+    createLegacyClient,
+  });
+};
+
+const isMain = process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url;
+export const reportCliFailure = (error) => {
+  console.error(formatErrorSummary(toSafeError(error)));
   process.exitCode = 1;
-});
+  // A raced-out Axios request cannot be aborted through the public client API.
+  // Give stderr a brief flush window, then prevent its socket from pinning CI.
+  const forcedExit = setTimeout(() => process.exit(1), 150);
+  forcedExit.unref();
+};
+
+if (isMain) {
+  runCli().catch(reportCliFailure);
+}

@@ -1,97 +1,70 @@
 name: Rolling Bootstrap Self-Update
 
 on:
-  workflow_dispatch:
-    inputs:
-      target_version:
-        description: "Target @peerbit/server version (for example 5.10.14)"
-        required: true
-        type: string
-      bootstrap_file:
-        description: "Bootstrap file path in repo"
-        required: false
-        default: "bootstrap-4.env"
-        type: string
-      batch_size:
-        description: "Nodes to update in parallel per batch"
-        required: false
-        default: "1"
-        type: string
-      wait_ready_timeout_ms:
-        description: "Readiness timeout per node in ms"
-        required: false
-        default: "180000"
-        type: string
-      wait_ready_delay_ms:
-        description: "Readiness poll interval in ms"
-        required: false
-        default: "3000"
-        type: string
-      rollback_on_failure:
-        description: "Attempt rollback to per-node previous version on failure"
-        required: false
-        default: true
-        type: boolean
   workflow_call:
     inputs:
-      target_version:
+      config_file:
         required: true
         type: string
-      bootstrap_file:
-        required: false
-        default: "bootstrap-4.env"
-        type: string
-      batch_size:
-        required: false
-        default: "1"
-        type: string
-      wait_ready_timeout_ms:
-        required: false
-        default: "180000"
-        type: string
-      wait_ready_delay_ms:
-        required: false
-        default: "3000"
-        type: string
-      rollback_on_failure:
-        required: false
-        default: true
-        type: boolean
-    secrets:
-      PEERBIT_ADMIN_KEY_B64:
-        required: true
 
 permissions:
   contents: read
 
 jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.x
+
+      - name: Install locked rollout dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Validate migration contract
+        env:
+          ROLLOUT_CONFIG_FILE: ${{ inputs.config_file }}
+        run: |
+          node scripts/rolling-self-update.mjs --validate-config --config-file "$ROLLOUT_CONFIG_FILE"
+          npm audit --omit=dev --audit-level=high
+
+      - name: Test rollout state machine
+        run: npm run test:rollout
+
   rolling_update:
+    needs: validate
     runs-on: ubuntu-22.04
     environment: production
     timeout-minutes: 45
     concurrency:
-      group: rolling-self-update-${{ inputs.bootstrap_file }}
+      group: peerbit-bootstrap-production
       cancel-in-progress: false
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22.x
 
-      - name: Install dependencies
-        run: npm install
+      - name: Install locked rollout dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
 
       - name: Rolling self-update
         env:
           PEERBIT_ADMIN_KEY_B64: ${{ secrets.PEERBIT_ADMIN_KEY_B64 }}
-        run: |
-          node scripts/rolling-self-update.mjs \
-            --bootstrap-file "${{ inputs.bootstrap_file }}" \
-            --target-version "${{ inputs.target_version }}" \
-            --batch-size "${{ inputs.batch_size }}" \
-            --wait-ready-timeout-ms "${{ inputs.wait_ready_timeout_ms }}" \
-            --wait-ready-delay-ms "${{ inputs.wait_ready_delay_ms }}" \
-            --rollback-on-failure "${{ inputs.rollback_on_failure }}"
+          ROLLOUT_CONFIG_FILE: ${{ inputs.config_file }}
+        run: node scripts/rolling-self-update.mjs --config-file "$ROLLOUT_CONFIG_FILE"
+
+      - name: Verify production DNS, TLS, identity, and WebSocket
+        run: node scripts/monitor-relays.mjs
