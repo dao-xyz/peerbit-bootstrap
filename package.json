@@ -6,14 +6,14 @@
     "build": "node scripts/build-bootstrap.mjs",
     "monitor": "node scripts/monitor-relays.mjs",
     "verify:public": "node scripts/verify-public.mjs",
-    "rolling-self-update": "node scripts/rolling-self-update.mjs"
+    "rolling-self-update": "node scripts/rolling-self-update.mjs",
+    "validate:rollout": "node scripts/rolling-self-update.mjs --validate-config --config-file rollouts/bootstrap-5.json",
+    "test:rollout": "node --test scripts/rolling-self-update.spec.mjs"
   },
   "dependencies": {
     "@dao-xyz/borsh": "^6.0.1",
-    "@peerbit/crypto": "3.1.1",
-    "@peerbit/server": "^6.0.36"
-  },
-  "overrides": {
-    "@peerbit/crypto": "$@peerbit/crypto"
+    "@peerbit/crypto": "3.1.4",
+    "@peerbit/server": "8.0.0",
+    "@peerbit/server-legacy": "npm:@peerbit/server@6.0.36"
   }
 }
