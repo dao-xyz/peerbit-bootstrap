@@ -13,7 +13,6 @@ on:
       - ".github/workflows/ci.yml"
       - ".github/workflows/deploy-bootstrap-rollout.yml"
       - ".github/workflows/monitor.yml"
-      - ".github/workflows/rolling-self-update.yml"
   push:
     branches:
       - master
@@ -28,7 +27,6 @@ on:
       - ".github/workflows/ci.yml"
       - ".github/workflows/deploy-bootstrap-rollout.yml"
       - ".github/workflows/monitor.yml"
-      - ".github/workflows/rolling-self-update.yml"
 
 permissions:
   contents: read

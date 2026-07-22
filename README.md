@@ -86,8 +86,9 @@ per-node previous `@peerbit/server` version.
 ## PR-driven bootstrap rollouts
 
 Changing `rollouts/bootstrap-5.json` on `master` triggers `Deploy Bootstrap Rollout`.
-That workflow calls the reusable rolling-update workflow, keeping production
-rollouts behind normal review. Nodes already on the requested version are skipped.
+Its secret-free validation job must pass before the direct production-environment
+job can access the administration key. Nodes already on the requested version are
+skipped.
 
 The signed-request v1 to v2 migration uses exact, lockfile-pinned v6 and v8 admin
 clients. The legacy client verifies the reviewed source fingerprint and only
