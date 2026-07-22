@@ -210,7 +210,7 @@ test("--validate-config succeeds without loading an administration secret", () =
     waitReadyTimeoutMs: 180000,
     waitReadyDelayMs: 3000,
     rollbackOnFailure: true,
-    rerollReason: "peerbit-server-8.0.0-signed-request-v2-migration",
+    rerollReason: "peerbit-server-8.0.0-environment-secret-retry",
   });
 });
 
