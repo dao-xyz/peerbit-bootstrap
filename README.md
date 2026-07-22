@@ -90,19 +90,20 @@ Its secret-free validation job must pass before the direct production-environmen
 job can access the administration key. Nodes already on the requested version are
 skipped.
 
-The signed-request v1 to v2 migration uses exact, lockfile-pinned v6 and v8 admin
-clients. The legacy client verifies the reviewed source fingerprint and only
-initiates the update. A fresh v8 client then pins the peer ID from the bootstrap
-multiaddr, verifies the signed authentication descriptor, and checks the complete
-target dependency fingerprint. A failed transition performs a protocol-aware
-rollback to the explicit reviewed version and treats an unverifiable rollback as
-fatal.
+The signed-request v1 to v2 migration used exact, lockfile-pinned v6 and v8 admin
+clients. After the verified fleet-wide v8 rollout, the temporary v1 client was
+retired. Current tooling uses only signed-request v2: it pins the peer ID from the
+bootstrap multiaddr, verifies the signed authentication descriptor, and checks the
+complete target dependency fingerprint. The completed v6-to-v8 configuration is
+kept as an inert audit record and cannot initiate another legacy transition.
 
-The rollout configuration also pins the npm SHA-512 integrity for both server
-versions. CI validates the config, lockfile, package metadata, state-machine tests,
-and high/critical dependency audit before the production job can access its secret.
-The temporary v6 client alias should be removed after the v8 rollout has completed
-and been independently verified.
+For active v8-to-v8 rollouts, the local package and lockfile pin the target admin
+client and its npm SHA-512 integrity. `rollbackIntegrity` is reviewed audit metadata
+for the remote package selected by `selfUpdate`; it is not installed as a local
+alias. Exact authenticated dependency fingerprints enforce both the source
+preflight and rollback result. CI validates the config, lockfile, package metadata,
+state-machine tests, and high/critical dependency audit before the production job
+can access its secret.
 
 Rollouts run only from a reviewed `master` push; direct arbitrary-version dispatch
 and broad secret inheritance are disabled. The production environment provides

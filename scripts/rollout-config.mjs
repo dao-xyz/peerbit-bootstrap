@@ -30,8 +30,35 @@ const ROOT_DEPENDENCY_KEYS = [
   "@dao-xyz/borsh",
   "@peerbit/crypto",
   "@peerbit/server",
-  "@peerbit/server-legacy",
 ];
+
+const MIN_SIGNED_REQUEST_V2_SERVER_MAJOR = 8;
+
+const COMPLETED_LEGACY_CONTRACT = Object.freeze({
+  expectedCurrentVersion: "6.0.36",
+  rollbackVersion: "6.0.36",
+  rollbackIntegrity:
+    "sha512-wrPcM191ghqZCjbJbpXKb01bvgMvBT/crZlmUBsdPgvZBPtkjouGzRo+O6VhpGLrrSRN53fF7YiRBS0KX1TBZA==",
+  rollbackFingerprint: Object.freeze({
+    peerbit: "5.3.0",
+    "@peerbit/blocks": "4.2.0",
+    "@peerbit/crypto": "3.1.2",
+    "@peerbit/program": "6.0.32",
+    "@peerbit/pubsub": "5.3.0",
+    "@peerbit/time": "3.0.0",
+  }),
+  targetVersion: "8.0.0",
+  targetIntegrity:
+    "sha512-D4xWIfN9erw3ap/b2SQXzYhHHN1UfSWi2DjfYhcgDKUwl9ivJQKLYxbsLe72ZJvKCm2iGyG4Gq9z0dTAjxMo/w==",
+  targetFingerprint: Object.freeze({
+    peerbit: "5.3.10",
+    "@peerbit/blocks": "4.2.6",
+    "@peerbit/crypto": "3.1.4",
+    "@peerbit/program": "6.0.39",
+    "@peerbit/pubsub": "5.3.4",
+    "@peerbit/time": "3.0.1",
+  }),
+});
 
 const SEMVER =
   /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/;
@@ -60,6 +87,40 @@ const assertExactKeys = (value, expected, label) => {
 
 const assertExactSemver = (value, label) => {
   ensure(typeof value === "string" && SEMVER.test(value), `${label} must be an exact semver`);
+};
+
+const semverMajor = (value) => Number(value.split(".", 1)[0]);
+
+const exactObjectValues = (actual, expected) =>
+  Object.entries(expected).every(([key, value]) => actual[key] === value);
+
+export const classifyRolloutContract = (config) => {
+  const sourceMajor = semverMajor(config.expectedCurrentVersion);
+  const rollbackMajor = semverMajor(config.rollbackVersion);
+  const targetMajor = semverMajor(config.targetVersion);
+  ensure(
+    targetMajor >= MIN_SIGNED_REQUEST_V2_SERVER_MAJOR,
+    `targetVersion must be @peerbit/server v${MIN_SIGNED_REQUEST_V2_SERVER_MAJOR} or newer`,
+  );
+
+  if (
+    config.expectedCurrentVersion === COMPLETED_LEGACY_CONTRACT.expectedCurrentVersion &&
+    config.rollbackVersion === COMPLETED_LEGACY_CONTRACT.rollbackVersion &&
+    config.rollbackIntegrity === COMPLETED_LEGACY_CONTRACT.rollbackIntegrity &&
+    exactObjectValues(config.rollbackFingerprint, COMPLETED_LEGACY_CONTRACT.rollbackFingerprint) &&
+    config.targetVersion === COMPLETED_LEGACY_CONTRACT.targetVersion &&
+    config.targetIntegrity === COMPLETED_LEGACY_CONTRACT.targetIntegrity &&
+    exactObjectValues(config.targetFingerprint, COMPLETED_LEGACY_CONTRACT.targetFingerprint)
+  ) {
+    return "completed-legacy";
+  }
+
+  ensure(
+    sourceMajor >= MIN_SIGNED_REQUEST_V2_SERVER_MAJOR &&
+      rollbackMajor >= MIN_SIGNED_REQUEST_V2_SERVER_MAJOR,
+    "legacy rollout contracts are retired; only the completed 6.0.36 -> 8.0.0 contract or v8+ source/rollback versions are allowed",
+  );
+  return "v8-native";
 };
 
 const assertIntegrity = (value, label) => {
@@ -149,10 +210,20 @@ const assertConfigSchema = (config) => {
   );
   ensure(config.targetVersion !== config.rollbackVersion, "targetVersion must differ from rollbackVersion");
   assertIntegrity(config.targetIntegrity, "targetIntegrity");
+  // rollbackIntegrity remains reviewed audit metadata for the remote package
+  // selected by selfUpdate. The v8-native client does not execute that package
+  // locally, so no rollback alias belongs in this repository's dependency tree;
+  // runtime rollback safety is enforced by the exact post-update fingerprint.
   assertIntegrity(config.rollbackIntegrity, "rollbackIntegrity");
   ensure(config.targetIntegrity !== config.rollbackIntegrity, "targetIntegrity must differ from rollbackIntegrity");
   assertFingerprint(config.targetFingerprint, "targetFingerprint");
   assertFingerprint(config.rollbackFingerprint, "rollbackFingerprint");
+  ensure(
+    FINGERPRINT_KEYS.some(
+      (key) => config.targetFingerprint[key] !== config.rollbackFingerprint[key],
+    ),
+    "targetFingerprint must differ from rollbackFingerprint",
+  );
   assertInteger(config.batchSize, "batchSize", 1, 32);
   ensure(config.batchSize === 1, "batchSize must be exactly 1 for the production migration");
   assertInteger(config.waitReadyTimeoutMs, "waitReadyTimeoutMs", 1_000, 3_600_000);
@@ -167,6 +238,7 @@ const assertConfigSchema = (config) => {
       /^[a-z0-9][a-z0-9._-]{0,127}$/.test(config.rerollReason),
     "rerollReason must be a lowercase, single-line audit slug",
   );
+  return classifyRolloutContract(config);
 };
 
 const assertFingerprintMatchesPackage = (entry, fingerprint, label) => {
@@ -179,7 +251,7 @@ const assertFingerprintMatchesPackage = (entry, fingerprint, label) => {
   }
 };
 
-const assertServerLockEntry = ({ entry, version, integrity, fingerprint, label, aliased }) => {
+const assertServerLockEntry = ({ entry, version, integrity, fingerprint, label }) => {
   ensure(isPlainObject(entry), `package-lock.json is missing ${label}`);
   ensure(entry.version === version, `${label}.version must be ${version}`);
   ensure(entry.integrity === integrity, `${label}.integrity does not match the audited config`);
@@ -187,11 +259,7 @@ const assertServerLockEntry = ({ entry, version, integrity, fingerprint, label, 
     entry.resolved === `https://registry.npmjs.org/@peerbit/server/-/server-${version}.tgz`,
     `${label}.resolved must be the canonical npm registry tarball`,
   );
-  if (aliased) {
-    ensure(entry.name === "@peerbit/server", `${label}.name must identify the aliased package`);
-  } else {
-    ensure(entry.name === undefined || entry.name === "@peerbit/server", `${label}.name is invalid`);
-  }
+  ensure(entry.name === undefined || entry.name === "@peerbit/server", `${label}.name is invalid`);
   assertFingerprintMatchesPackage(entry, fingerprint, label);
 };
 
@@ -202,15 +270,10 @@ const assertPackageContracts = (repoRoot, config) => {
   const lock = readJson(lockFile, "package-lock.json");
 
   assertExactKeys(packageJson.dependencies, ROOT_DEPENDENCY_KEYS, "package.json dependencies");
-  ensure(packageJson.overrides === undefined, "package.json overrides are forbidden for dual-client rollouts");
+  ensure(packageJson.overrides === undefined, "package.json overrides are forbidden for rollout tooling");
   ensure(
     packageJson.dependencies["@peerbit/server"] === config.targetVersion,
     "package.json must pin @peerbit/server to targetVersion",
-  );
-  ensure(
-    packageJson.dependencies["@peerbit/server-legacy"] ===
-      `npm:@peerbit/server@${config.rollbackVersion}`,
-    "package.json must pin @peerbit/server-legacy to the rollbackVersion npm alias",
   );
   ensure(
     packageJson.dependencies["@peerbit/crypto"] === config.targetFingerprint["@peerbit/crypto"],
@@ -220,6 +283,10 @@ const assertPackageContracts = (repoRoot, config) => {
   ensure(lock.lockfileVersion === 3, "package-lock.json must use lockfileVersion 3");
   ensure(lock.requires === true, "package-lock.json must set requires=true");
   ensure(isPlainObject(lock.packages), "package-lock.json packages must be an object");
+  ensure(
+    lock.packages["node_modules/@peerbit/server-legacy"] === undefined,
+    "package-lock.json must not retain the retired @peerbit/server-legacy alias",
+  );
   const lockRoot = lock.packages[""];
   ensure(isPlainObject(lockRoot), "package-lock.json is missing its root package entry");
   assertExactKeys(lockRoot.dependencies, ROOT_DEPENDENCY_KEYS, "package-lock root dependencies");
@@ -236,15 +303,6 @@ const assertPackageContracts = (repoRoot, config) => {
     integrity: config.targetIntegrity,
     fingerprint: config.targetFingerprint,
     label: "package-lock target @peerbit/server",
-    aliased: false,
-  });
-  assertServerLockEntry({
-    entry: lock.packages["node_modules/@peerbit/server-legacy"],
-    version: config.rollbackVersion,
-    integrity: config.rollbackIntegrity,
-    fingerprint: config.rollbackFingerprint,
-    label: "package-lock legacy @peerbit/server",
-    aliased: true,
   });
 };
 
@@ -256,7 +314,7 @@ export const readAndValidateRolloutConfig = ({
   ensure(typeof configFile === "string", "Missing --config-file");
   const resolvedConfigFile = resolveRepoFile(root, configFile, "config file", ".json");
   const config = readJson(resolvedConfigFile, "rollout config");
-  assertConfigSchema(config);
+  const rolloutMode = assertConfigSchema(config);
   const bootstrapPath = resolveRepoFile(root, config.bootstrapFile, "bootstrap file", ".env");
   assertPackageContracts(root, config);
   return Object.freeze({
@@ -267,6 +325,7 @@ export const readAndValidateRolloutConfig = ({
     configPath: resolvedConfigFile,
     bootstrapPath,
     repoRoot: root,
+    rolloutMode,
   });
 };
 
