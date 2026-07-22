@@ -82,7 +82,7 @@ jobs:
       - name: Validate rollout dependency graph
         run: |
           npm run validate:rollout
-          npm ls @peerbit/crypto @peerbit/server @peerbit/server-legacy
+          npm ls @peerbit/crypto @peerbit/server
           npm audit --omit=dev --audit-level=high
 
       - name: Test rollout state machine

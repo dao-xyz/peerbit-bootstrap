@@ -7,6 +7,7 @@ import net from "node:net";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
+  classifyRolloutContract,
   readAndValidateRolloutConfig,
   rolloutConfigOutput,
 } from "./rollout-config.mjs";
@@ -301,9 +302,6 @@ export const waitForPublicWebSocket = async (
 const createPinnedV8 = (createV8Client, keypair, remote) =>
   createV8Client(keypair, { address: remote.address, peerId: remote.peerId });
 
-const createLegacy = (createLegacyClient, keypair, remote) =>
-  createLegacyClient(keypair, { address: remote.address });
-
 const readClientState = async (api, { verifyDescriptor = false } = {}) => {
   const firstPeerId = await api.peer.id.get();
   const descriptorPeerId = verifyDescriptor ? await api.peer.id.verify() : undefined;
@@ -390,11 +388,6 @@ const readFreshV8State = async ({ createV8Client, keypair, remote }) => {
   return { api, state: await readClientState(api, { verifyDescriptor: true }) };
 };
 
-const readFreshLegacyState = async ({ createLegacyClient, keypair, remote }) => {
-  const api = await createLegacy(createLegacyClient, keypair, remote);
-  return { api, state: await readClientState(api) };
-};
-
 const waitForV8Target = async ({
   createV8Client,
   keypair,
@@ -420,8 +413,8 @@ const waitForV8Target = async ({
     sleepImpl,
   });
 
-const waitForLegacyRollback = async ({
-  createLegacyClient,
+const waitForV8Source = async ({
+  createV8Client,
   keypair,
   remote,
   config,
@@ -429,65 +422,90 @@ const waitForLegacyRollback = async ({
 }) =>
   retry({
     operation: async () => {
-      const result = await readFreshLegacyState({ createLegacyClient, keypair, remote });
-      assertIdentity(result.state, remote, "legacy rollback postcheck");
+      const result = await readFreshV8State({ createV8Client, keypair, remote });
+      assertIdentity(result.state, remote, "v8 rollback postcheck");
       assertDependencyFingerprint(
         result.state,
         config.rollbackVersion,
         config.rollbackFingerprint,
-        `${remote.name} legacy rollback postcheck`,
+        `${remote.name} v8 rollback postcheck`,
       );
       return result;
     },
     timeoutMs: config.waitReadyTimeoutMs,
     delayMs: config.waitReadyDelayMs,
-    description: `${remote.name} legacy rollback postcheck`,
+    description: `${remote.name} fresh authenticated v8 rollback client`,
     sleepImpl,
   });
 
-const preflightRemoteOnce = async ({ createV8Client, createLegacyClient, keypair, remote, config }) => {
-  let v8Error;
-  try {
-    const result = await readFreshV8State({ createV8Client, keypair, remote });
-    assertIdentity(result.state, remote, "v8 preflight");
-    assertDependencyFingerprint(
-      result.state,
-      config.targetVersion,
-      config.targetFingerprint,
-      `${remote.name} v8 preflight`,
+const fingerprintMismatches = (state, expectedFingerprint) =>
+  Object.entries(expectedFingerprint)
+    .filter(([dependency, version]) => state.versions[dependency] !== version)
+    .map(
+      ([dependency, version]) =>
+        `${dependency}: expected ${version}, got ${state.versions[dependency] ?? "missing"}`,
     );
-    return { protocol: "v8", ...result };
-  } catch (error) {
-    if (error instanceof RolloutInvariantError) throw error;
-    v8Error = toSafeError(error);
+
+const fingerprintMatches = (state, expectedFingerprint) =>
+  fingerprintMismatches(state, expectedFingerprint).length === 0;
+
+const classifyV8State = (state, config, label) => {
+  const advertisedServer = state.versions["@peerbit/server"];
+  const sourceMatches = fingerprintMatches(state, config.rollbackFingerprint);
+  const targetMatches = fingerprintMatches(state, config.targetFingerprint);
+
+  if (advertisedServer !== undefined) {
+    ensure(
+      advertisedServer === config.expectedCurrentVersion || advertisedServer === config.targetVersion,
+      `${label}: unsupported @peerbit/server@${advertisedServer}; expected ${config.expectedCurrentVersion} or ${config.targetVersion}`,
+      RolloutInvariantError,
+    );
+    if (advertisedServer === config.targetVersion) {
+      ensure(
+        targetMatches,
+        `${label}: target dependency fingerprint mismatch (${fingerprintMismatches(
+          state,
+          config.targetFingerprint,
+        ).join("; ")})`,
+        RolloutInvariantError,
+      );
+      return "target";
+    }
+    ensure(
+      sourceMatches,
+      `${label}: source dependency fingerprint mismatch (${fingerprintMismatches(
+        state,
+        config.rollbackFingerprint,
+      ).join("; ")})`,
+      RolloutInvariantError,
+    );
+    return "source";
   }
 
-  try {
-    const result = await readFreshLegacyState({ createLegacyClient, keypair, remote });
-    assertIdentity(result.state, remote, "legacy preflight");
-    assertDependencyFingerprint(
-      result.state,
-      config.expectedCurrentVersion,
-      config.rollbackFingerprint,
-      `${remote.name} legacy preflight`,
-    );
-    return { protocol: "legacy", ...result };
-  } catch (legacyError) {
-    if (legacyError instanceof RolloutInvariantError) throw legacyError;
-    throw new AggregateError(
-      [v8Error, toSafeError(legacyError)],
-      `${remote.name}: neither pinned v8 nor legacy protocol was reachable`,
-    );
-  }
+  ensure(
+    sourceMatches !== targetMatches,
+    sourceMatches
+      ? `${label}: source and target fingerprints are ambiguous without @peerbit/server`
+      : `${label}: dependency fingerprint matches neither the reviewed source nor target`,
+    RolloutInvariantError,
+  );
+  return targetMatches ? "target" : "source";
 };
 
-const preflightRemote = ({ createV8Client, createLegacyClient, keypair, remote, config, sleepImpl }) =>
+const preflightRemote = ({ createV8Client, keypair, remote, config, sleepImpl }) =>
   retry({
-    operation: () =>
-      preflightRemoteOnce({ createV8Client, createLegacyClient, keypair, remote, config }),
+    operation: async () => {
+      const result = await readFreshV8State({ createV8Client, keypair, remote });
+      assertIdentity(result.state, remote, "v8 preflight");
+      return {
+        protocol: "v8",
+        phase: classifyV8State(result.state, config, `${remote.name} v8 preflight`),
+        ...result,
+      };
+    },
     timeoutMs: config.waitReadyTimeoutMs,
     delayMs: config.waitReadyDelayMs,
-    description: `${remote.name} protocol-aware preflight`,
+    description: `${remote.name} pinned signed-request-v2 preflight`,
     sleepImpl,
   });
 
@@ -502,7 +520,6 @@ const rollbackOne = async ({
   config,
   keypair,
   createV8Client,
-  createLegacyClient,
   waitForPublicWebSocketImpl,
   sleepImpl,
   logger,
@@ -510,54 +527,46 @@ const rollbackOne = async ({
   const { remote } = item;
   const detected = await retry({
     operation: async () => {
-      let v8Error;
-      try {
-        const result = await readFreshV8State({ createV8Client, keypair, remote });
-        assertIdentity(result.state, remote, "v8 rollback preflight");
-        // A fingerprint mismatch may be the reason for rollback. The pinned v8
-        // descriptor and exact peer ID authorize recovery; an advertised server
-        // version, when present, must still be the reviewed target.
-        assertOptionalServerVersion(
-          result.state,
-          config.targetVersion,
-          `${remote.name} v8 rollback preflight`,
+      const result = await readFreshV8State({ createV8Client, keypair, remote });
+      assertIdentity(result.state, remote, "v8 rollback preflight");
+      const advertisedServer = result.state.versions["@peerbit/server"];
+      const sourceMatches = fingerprintMatches(result.state, config.rollbackFingerprint);
+      const targetMatches = fingerprintMatches(result.state, config.targetFingerprint);
+
+      if (advertisedServer !== undefined) {
+        ensure(
+          advertisedServer === config.rollbackVersion || advertisedServer === config.targetVersion,
+          `${remote.name}: rollback observed unsupported @peerbit/server@${advertisedServer}`,
+          RolloutInvariantError,
         );
-        return { protocol: "v8", ...result };
-      } catch (error) {
-        if (error instanceof RolloutInvariantError) throw error;
-        v8Error = toSafeError(error);
       }
 
-      try {
-        const result = await readFreshLegacyState({ createLegacyClient, keypair, remote });
-        assertIdentity(result.state, remote, "rollback legacy detection");
-        assertDependencyFingerprint(
-          result.state,
-          config.rollbackVersion,
-          config.rollbackFingerprint,
-          `${remote.name} rollback legacy detection`,
-        );
+      if (sourceMatches && (advertisedServer === undefined || advertisedServer === config.rollbackVersion)) {
         if (item.forwardPhase !== "not-called") {
           throw new Error(
-            `${remote.name}: forward selfUpdate is ${item.forwardPhase}; legacy state is ambiguous until pinned v8 is observed`,
+            `${remote.name}: forward selfUpdate is ${item.forwardPhase}; source state is ambiguous until the target is observed`,
           );
         }
-        return { protocol: "legacy", ...result };
-      } catch (legacyError) {
-        if (legacyError instanceof RolloutInvariantError) throw legacyError;
-        throw new AggregateError(
-          [v8Error, toSafeError(legacyError)],
-          `${remote.name}: rollback could not identify either supported protocol`,
-        );
+        return { action: "unchanged", ...result };
       }
+
+      // The exact target fingerprint is preferred. A dependency mismatch may be
+      // the reason rollback is running, so a pinned signed descriptor also permits
+      // recovery when the server either advertises the target or omits its version.
+      ensure(
+        targetMatches || advertisedServer === config.targetVersion || advertisedServer === undefined,
+        `${remote.name}: rollback could not establish a reviewed target state`,
+        RolloutInvariantError,
+      );
+      return { action: "rollback", ...result };
     },
     timeoutMs: config.waitReadyTimeoutMs,
     delayMs: config.waitReadyDelayMs,
-    description: `${remote.name} rollback protocol detection`,
+    description: `${remote.name} pinned v8 rollback detection`,
     sleepImpl,
   });
 
-  if (detected.protocol === "v8") {
+  if (detected.action === "rollback") {
     const response = await withTimeout(
       () => detected.api.selfUpdate(config.rollbackVersion),
       config.waitReadyTimeoutMs,
@@ -565,10 +574,10 @@ const rollbackOne = async ({
     );
     assertSelfUpdateResponse(response, config.rollbackVersion, `${remote.name} rollback`);
   } else {
-    logger.log(`${remote.name}: forward call was not invoked; reviewed legacy state is unchanged`);
+    logger.log(`${remote.name}: forward call was not invoked; reviewed v8 source state is unchanged`);
   }
 
-  await waitForLegacyRollback({ createLegacyClient, keypair, remote, config, sleepImpl });
+  await waitForV8Source({ createV8Client, keypair, remote, config, sleepImpl });
   await waitForPublicWebSocketImpl(remote, config.waitReadyTimeoutMs, config.waitReadyDelayMs, {
     sleepImpl,
   });
@@ -580,7 +589,6 @@ export const runRollingSelfUpdate = async ({
   remotes,
   keypair,
   createV8Client,
-  createLegacyClient,
   waitForPublicWebSocketImpl = waitForPublicWebSocket,
   sleepImpl = sleep,
   logger = console,
@@ -588,20 +596,26 @@ export const runRollingSelfUpdate = async ({
   ensure(config && typeof config === "object", "config is required");
   ensure(Array.isArray(remotes) && remotes.length > 0, "at least one remote is required");
   ensure(typeof createV8Client === "function", "createV8Client is required");
-  ensure(typeof createLegacyClient === "function", "createLegacyClient is required");
+  const rolloutMode = classifyRolloutContract(config);
+  if (config.rolloutMode !== undefined) {
+    ensure(
+      config.rolloutMode === rolloutMode,
+      `rolloutMode must be ${rolloutMode} for the reviewed contract`,
+      RolloutInvariantError,
+    );
+  }
 
   logger.log(`Resolved ${remotes.length} remotes from ${config.bootstrapFile}`);
   const preflight = [];
   for (const remote of remotes) {
     const result = await preflightRemote({
       createV8Client,
-      createLegacyClient,
       keypair,
       remote,
       config,
       sleepImpl,
     });
-    if (result.protocol === "v8") {
+    if (result.phase === "target") {
       await waitForPublicWebSocketImpl(
         remote,
         config.waitReadyTimeoutMs,
@@ -610,6 +624,11 @@ export const runRollingSelfUpdate = async ({
       );
       logger.log(`${remote.name}: already on verified @peerbit/server@${config.targetVersion}`);
     } else {
+      ensure(
+        rolloutMode === "v8-native",
+        `${remote.name}: completed legacy rollout contract is inert and the pinned v8 target is not exact; refusing mutation`,
+        RolloutInvariantError,
+      );
       try {
         await waitForPublicWebSocketImpl(
           remote,
@@ -624,12 +643,12 @@ export const runRollingSelfUpdate = async ({
           }`,
         );
       }
-      logger.log(`${remote.name}: verified legacy source @peerbit/server@${config.expectedCurrentVersion}`);
+      logger.log(`${remote.name}: verified v8 source @peerbit/server@${config.expectedCurrentVersion}`);
     }
-    preflight.push({ remote, protocol: result.protocol, forwardPhase: "not-called" });
+    preflight.push({ remote, phase: result.phase, forwardPhase: "not-called" });
   }
 
-  const sources = preflight.filter((item) => item.protocol === "legacy");
+  const sources = preflight.filter((item) => item.phase === "source");
   const transitioned = new Set();
   let completed = 0;
 
@@ -638,11 +657,25 @@ export const runRollingSelfUpdate = async ({
     const settled = await Promise.allSettled(
       batch.map(async (item) => {
         try {
+          const freshSource = await withTimeout(
+            () => readFreshV8State({ createV8Client, keypair, remote: item.remote }),
+            config.waitReadyTimeoutMs,
+            `${item.remote.name} fresh v8 mutation preflight`,
+          );
+          assertIdentity(freshSource.state, item.remote, "v8 mutation preflight");
+          ensure(
+            classifyV8State(
+              freshSource.state,
+              config,
+              `${item.remote.name} v8 mutation preflight`,
+            ) === "source",
+            `${item.remote.name}: source changed before mutation`,
+            RolloutInvariantError,
+          );
           transitioned.add(item);
-          const api = await createLegacy(createLegacyClient, keypair, item.remote);
           item.forwardPhase = "ambiguous";
           const response = await withTimeout(
-            () => api.selfUpdate(config.targetVersion),
+            () => freshSource.api.selfUpdate(config.targetVersion),
             config.waitReadyTimeoutMs,
             `${item.remote.name} forward selfUpdate`,
           );
@@ -680,6 +713,12 @@ export const runRollingSelfUpdate = async ({
     if (!config.rollbackOnFailure) {
       throw new AggregateError(updateErrors, `Rolling update failed in batch ${batchIndex + 1}`);
     }
+    if (transitioned.size === 0) {
+      throw new AggregateError(
+        updateErrors,
+        `Rolling update failed in batch ${batchIndex + 1} before any selfUpdate was initiated`,
+      );
+    }
 
     const rollbackErrors = [];
     logger.log(`Starting protocol-aware rollback for ${transitioned.size} node(s)`);
@@ -690,7 +729,6 @@ export const runRollingSelfUpdate = async ({
           config,
           keypair,
           createV8Client,
-          createLegacyClient,
           waitForPublicWebSocketImpl,
           sleepImpl,
           logger,
@@ -745,15 +783,13 @@ export const runCli = async (argv = process.argv) => {
   }
 
   const keypair = await decodeKeypair();
-  const [{ createClient: createV8Client }, { createClient: createLegacyClient }] =
-    await Promise.all([import("@peerbit/server"), import("@peerbit/server-legacy")]);
+  const { createClient: createV8Client } = await import("@peerbit/server");
   const remotes = readBootstrapRemotes(config.bootstrapPath);
   await runRollingSelfUpdate({
     config,
     remotes,
     keypair,
     createV8Client,
-    createLegacyClient,
   });
 };
 

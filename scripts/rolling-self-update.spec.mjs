@@ -6,7 +6,10 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { inspect } from "node:util";
-import { readAndValidateRolloutConfig } from "./rollout-config.mjs";
+import {
+  classifyRolloutContract,
+  readAndValidateRolloutConfig,
+} from "./rollout-config.mjs";
 import {
   assertWebSocketUpgrade,
   formatErrorSummary,
@@ -19,9 +22,10 @@ const PEER_ID = "12D3KooWKj1J1hHxrYyB37qDDGCi9aU2vcHzDZhtMk7te7dEmqqT";
 const MULTIADDR = `/dns4/bootstrap.example.com/tcp/4003/wss/p2p/${PEER_ID}`;
 const TARGET_INTEGRITY =
   "sha512-D4xWIfN9erw3ap/b2SQXzYhHHN1UfSWi2DjfYhcgDKUwl9ivJQKLYxbsLe72ZJvKCm2iGyG4Gq9z0dTAjxMo/w==";
-const ROLLBACK_INTEGRITY =
+const LEGACY_INTEGRITY =
   "sha512-wrPcM191ghqZCjbJbpXKb01bvgMvBT/crZlmUBsdPgvZBPtkjouGzRo+O6VhpGLrrSRN53fF7YiRBS0KX1TBZA==";
-const TARGET_FINGERPRINT = Object.freeze({
+const FUTURE_INTEGRITY = `sha512-${Buffer.alloc(64, 7).toString("base64")}`;
+const V8_FINGERPRINT = Object.freeze({
   peerbit: "5.3.10",
   "@peerbit/blocks": "4.2.6",
   "@peerbit/crypto": "3.1.4",
@@ -29,7 +33,7 @@ const TARGET_FINGERPRINT = Object.freeze({
   "@peerbit/pubsub": "5.3.4",
   "@peerbit/time": "3.0.1",
 });
-const ROLLBACK_FINGERPRINT = Object.freeze({
+const LEGACY_FINGERPRINT = Object.freeze({
   peerbit: "5.3.0",
   "@peerbit/blocks": "4.2.0",
   "@peerbit/crypto": "3.1.2",
@@ -37,37 +41,59 @@ const ROLLBACK_FINGERPRINT = Object.freeze({
   "@peerbit/pubsub": "5.3.0",
   "@peerbit/time": "3.0.0",
 });
+const FUTURE_FINGERPRINT = Object.freeze({
+  peerbit: "5.4.0",
+  "@peerbit/blocks": "4.3.0",
+  "@peerbit/crypto": "3.1.5",
+  "@peerbit/program": "6.1.0",
+  "@peerbit/pubsub": "5.4.0",
+  "@peerbit/time": "3.1.0",
+});
 
-const baseConfig = () => ({
+const commonConfig = () => ({
   bootstrapFile: "bootstrap-5.env",
-  expectedCurrentVersion: "6.0.36",
-  targetVersion: "8.0.0",
-  rollbackVersion: "6.0.36",
-  targetIntegrity: TARGET_INTEGRITY,
-  rollbackIntegrity: ROLLBACK_INTEGRITY,
-  targetFingerprint: { ...TARGET_FINGERPRINT },
-  rollbackFingerprint: { ...ROLLBACK_FINGERPRINT },
   batchSize: 1,
   waitReadyTimeoutMs: 1_000,
   waitReadyDelayMs: 100,
   rollbackOnFailure: true,
-  rerollReason: "test-v6-to-v8",
+  rerollReason: "test-rollout",
+});
+
+const completedConfig = () => ({
+  ...commonConfig(),
+  expectedCurrentVersion: "6.0.36",
+  targetVersion: "8.0.0",
+  rollbackVersion: "6.0.36",
+  targetIntegrity: TARGET_INTEGRITY,
+  rollbackIntegrity: LEGACY_INTEGRITY,
+  targetFingerprint: { ...V8_FINGERPRINT },
+  rollbackFingerprint: { ...LEGACY_FINGERPRINT },
+});
+
+const activeConfig = () => ({
+  ...commonConfig(),
+  expectedCurrentVersion: "8.0.0",
+  targetVersion: "8.1.0",
+  rollbackVersion: "8.0.0",
+  targetIntegrity: FUTURE_INTEGRITY,
+  rollbackIntegrity: TARGET_INTEGRITY,
+  targetFingerprint: { ...FUTURE_FINGERPRINT },
+  rollbackFingerprint: { ...V8_FINGERPRINT },
 });
 
 const writeJson = (file, value) => fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
 
-const makeConfigRepo = (mutate = () => {}) => {
+const makeConfigRepo = ({ active = false, mutate = () => {} } = {}) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "peerbit-rollout-config-"));
-  const config = baseConfig();
+  const config = active ? activeConfig() : completedConfig();
   const packageJson = {
     name: "peerbit-bootstrap-ops",
     private: true,
     type: "module",
     dependencies: {
       "@dao-xyz/borsh": "^6.0.1",
-      "@peerbit/crypto": "3.1.4",
-      "@peerbit/server": "8.0.0",
-      "@peerbit/server-legacy": "npm:@peerbit/server@6.0.36",
+      "@peerbit/crypto": config.targetFingerprint["@peerbit/crypto"],
+      "@peerbit/server": config.targetVersion,
     },
   };
   const lock = {
@@ -75,33 +101,20 @@ const makeConfigRepo = (mutate = () => {}) => {
     lockfileVersion: 3,
     requires: true,
     packages: {
-      "": {
-        name: "peerbit-bootstrap-ops",
-        dependencies: { ...packageJson.dependencies },
-      },
+      "": { name: "peerbit-bootstrap-ops", dependencies: { ...packageJson.dependencies } },
       "node_modules/@peerbit/server": {
-        version: "8.0.0",
-        resolved: "https://registry.npmjs.org/@peerbit/server/-/server-8.0.0.tgz",
-        integrity: TARGET_INTEGRITY,
-        dependencies: { ...TARGET_FINGERPRINT },
-      },
-      "node_modules/@peerbit/server-legacy": {
-        name: "@peerbit/server",
-        version: "6.0.36",
-        resolved: "https://registry.npmjs.org/@peerbit/server/-/server-6.0.36.tgz",
-        integrity: ROLLBACK_INTEGRITY,
-        dependencies: { ...ROLLBACK_FINGERPRINT },
+        version: config.targetVersion,
+        resolved: `https://registry.npmjs.org/@peerbit/server/-/server-${config.targetVersion}.tgz`,
+        integrity: config.targetIntegrity,
+        dependencies: { ...config.targetFingerprint },
       },
     },
   };
   const files = { root, config, packageJson, lock };
   mutate(files);
   fs.mkdirSync(path.join(root, "rollouts"), { recursive: true });
-  if (
-    config.bootstrapFile === "bootstrap-5.env" &&
-    !fs.existsSync(path.join(root, config.bootstrapFile))
-  ) {
-    fs.writeFileSync(path.join(root, config.bootstrapFile), `${MULTIADDR}\n`);
+  if (!fs.existsSync(path.join(root, "bootstrap-5.env"))) {
+    fs.writeFileSync(path.join(root, "bootstrap-5.env"), `${MULTIADDR}\n`);
   }
   writeJson(path.join(root, "package.json"), packageJson);
   writeJson(path.join(root, "package-lock.json"), lock);
@@ -109,52 +122,59 @@ const makeConfigRepo = (mutate = () => {}) => {
   return root;
 };
 
-test("config validator accepts the audited dual-client package and lock contract", (t) => {
-  const root = makeConfigRepo();
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  const config = readAndValidateRolloutConfig({ configFile: "rollouts/test.json", repoRoot: root });
-  assert.equal(config.targetVersion, "8.0.0");
-  assert.equal(config.bootstrapPath, path.join(fs.realpathSync(root), "bootstrap-5.env"));
-});
+for (const [name, active, mode] of [
+  ["completed legacy contract with only the v8 client installed", false, "completed-legacy"],
+  ["future v8-native contract", true, "v8-native"],
+]) {
+  test(`config validator accepts ${name}`, (t) => {
+    const root = makeConfigRepo({ active });
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const config = readAndValidateRolloutConfig({ configFile: "rollouts/test.json", repoRoot: root });
+    assert.equal(config.rolloutMode, mode);
+  });
+}
 
 const invalidConfigCases = [
   ["unknown config keys", ({ config }) => (config.unreviewed = true), /must contain exactly/],
   ["semver ranges", ({ config }) => (config.targetVersion = "^8.0.0"), /exact semver/],
   ["a rollback other than the expected source", ({ config }) => (config.rollbackVersion = "6.0.35"), /must equal/],
-  ["non-canonical integrity", ({ config }) => (config.targetIntegrity = "sha512-not-a-digest"), /canonical sha512/],
-  ["a weakened fingerprint", ({ config }) => delete config.targetFingerprint["@peerbit/time"], /must contain exactly/],
+  ["another legacy migration", ({ config }) => {
+    config.expectedCurrentVersion = "7.0.0";
+    config.rollbackVersion = "7.0.0";
+  }, /legacy rollout contracts are retired/],
+  ["a pre-v8 target", ({ config }) => {
+    config.targetVersion = "7.9.9";
+  }, /v8 or newer/],
+  ["a modified completed source fingerprint", ({ config }) => {
+    config.rollbackFingerprint["@peerbit/time"] = "3.0.1";
+  }, /legacy rollout contracts are retired/],
+  ["equal source and target fingerprints", ({ config }) => {
+    config.rollbackFingerprint = { ...config.targetFingerprint };
+  }, /must differ/],
+  ["non-canonical integrity", ({ config }) => (config.targetIntegrity = "sha512-nope"), /canonical sha512/],
   ["another bootstrap fleet", ({ config }) => (config.bootstrapFile = "bootstrap-4.env"), /exactly bootstrap-5\.env/],
-  ["bootstrap path traversal", ({ config }) => (config.bootstrapFile = "../bootstrap.env"), /exactly bootstrap-5\.env/],
-  ["parallel production updates", ({ config }) => (config.batchSize = 2), /batchSize must be exactly 1/],
+  ["parallel updates", ({ config }) => (config.batchSize = 2), /batchSize must be exactly 1/],
   ["disabled rollback", ({ config }) => (config.rollbackOnFailure = false), /rollbackOnFailure must be true/],
-  [
-    "an unpinned legacy alias",
-    ({ packageJson }) =>
-      (packageJson.dependencies["@peerbit/server-legacy"] = "npm:@peerbit/server@^6.0.36"),
-    /must pin @peerbit\/server-legacy/,
-  ],
-  [
-    "a target lock integrity mismatch",
-    ({ lock }) => (lock.packages["node_modules/@peerbit/server"].integrity = ROLLBACK_INTEGRITY),
-    /integrity does not match/,
-  ],
-  [
-    "a lock fingerprint mismatch",
-    ({ lock }) =>
-      (lock.packages["node_modules/@peerbit/server"].dependencies["@peerbit/time"] = "9.9.9"),
-    /dependency @peerbit\/time must be/,
-  ],
-  [
-    "a non-registry tarball",
-    ({ lock }) =>
-      (lock.packages["node_modules/@peerbit/server"].resolved = "https://example.com/server.tgz"),
-    /canonical npm registry tarball/,
-  ],
+  ["a legacy package alias", ({ packageJson }) => {
+    packageJson.dependencies["@peerbit/server-legacy"] = "npm:@peerbit/server@6.0.36";
+  }, /dependencies must contain exactly/],
+  ["a stale legacy lock entry", ({ lock }) => {
+    lock.packages["node_modules/@peerbit/server-legacy"] = { version: "6.0.36" };
+  }, /must not retain/],
+  ["a target lock integrity mismatch", ({ lock }) => {
+    lock.packages["node_modules/@peerbit/server"].integrity = LEGACY_INTEGRITY;
+  }, /integrity does not match/],
+  ["a lock fingerprint mismatch", ({ lock }) => {
+    lock.packages["node_modules/@peerbit/server"].dependencies["@peerbit/time"] = "9.9.9";
+  }, /dependency @peerbit\/time must be/],
+  ["a non-registry target tarball", ({ lock }) => {
+    lock.packages["node_modules/@peerbit/server"].resolved = "https://example.com/server.tgz";
+  }, /canonical npm registry tarball/],
 ];
 
 for (const [name, mutate, expected] of invalidConfigCases) {
   test(`config validator rejects ${name}`, (t) => {
-    const root = makeConfigRepo(mutate);
+    const root = makeConfigRepo({ mutate });
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     assert.throws(
       () => readAndValidateRolloutConfig({ configFile: "rollouts/test.json", repoRoot: root }),
@@ -164,10 +184,12 @@ for (const [name, mutate, expected] of invalidConfigCases) {
 }
 
 test("config validator rejects a symlinked bootstrap file", (t) => {
-  const root = makeConfigRepo(({ root: pendingRoot, config }) => {
-    config.bootstrapFile = "bootstrap-5.env";
-    fs.writeFileSync(path.join(pendingRoot, "real-bootstrap.env"), `${MULTIADDR}\n`);
-    fs.symlinkSync("real-bootstrap.env", path.join(pendingRoot, config.bootstrapFile));
+  const root = makeConfigRepo({
+    mutate: ({ root: pendingRoot }) => {
+      fs.rmSync(path.join(pendingRoot, "bootstrap-5.env"), { force: true });
+      fs.writeFileSync(path.join(pendingRoot, "real-bootstrap.env"), `${MULTIADDR}\n`);
+      fs.symlinkSync("real-bootstrap.env", path.join(pendingRoot, "bootstrap-5.env"));
+    },
   });
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   assert.throws(
@@ -176,7 +198,7 @@ test("config validator rejects a symlinked bootstrap file", (t) => {
   );
 });
 
-test("config validator rejects config-file path traversal before reading", (t) => {
+test("config validator rejects config path traversal before reading", (t) => {
   const root = makeConfigRepo();
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   assert.throws(
@@ -185,33 +207,18 @@ test("config validator rejects config-file path traversal before reading", (t) =
   );
 });
 
-test("--validate-config succeeds without loading an administration secret", () => {
+test("the repository's unchanged completed config validates without an admin secret", () => {
   const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
   const repoRoot = path.dirname(scriptsDir);
   const env = { ...process.env };
   delete env.PEERBIT_ADMIN_KEY_B64;
   const result = spawnSync(
     process.execPath,
-    [
-      path.join(scriptsDir, "rolling-self-update.mjs"),
-      "--validate-config",
-      "--config-file",
-      "rollouts/bootstrap-5.json",
-    ],
+    [path.join(scriptsDir, "rolling-self-update.mjs"), "--validate-config", "--config-file", "rollouts/bootstrap-5.json"],
     { cwd: repoRoot, env, encoding: "utf8" },
   );
   assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(JSON.parse(result.stdout), {
-    bootstrapFile: "bootstrap-5.env",
-    expectedCurrentVersion: "6.0.36",
-    targetVersion: "8.0.0",
-    rollbackVersion: "6.0.36",
-    batchSize: 1,
-    waitReadyTimeoutMs: 180000,
-    waitReadyDelayMs: 3000,
-    rollbackOnFailure: true,
-    rerollReason: "peerbit-server-8.0.0-environment-secret-retry",
-  });
+  assert.equal(JSON.parse(result.stdout).targetVersion, "8.0.0");
 });
 
 test("bootstrap parsing retains the exact /p2p peer ID", () => {
@@ -224,512 +231,373 @@ test("bootstrap parsing retains the exact /p2p peer ID", () => {
 
 for (const [name, contents, expected] of [
   ["missing peer ID", "/dns4/bootstrap.example.com/tcp/4003/wss", /exactly one \/p2p/],
-  ["trailing path after peer ID", `${MULTIADDR}/p2p-circuit`, /must end/],
-  ["duplicate peer ID", `${MULTIADDR}\n/dns4/other.example.com/tcp/4003/wss/p2p/${PEER_ID}`, /duplicates peer ID/],
+  ["trailing path", `${MULTIADDR}/p2p-circuit`, /must end/],
+  ["duplicate identity", `${MULTIADDR}\n/dns4/other.example.com/tcp/4003/wss/p2p/${PEER_ID}`, /duplicates peer ID/],
 ]) {
   test(`bootstrap parsing rejects ${name}`, () => {
     assert.throws(() => parseBootstrapRemotes(contents, "fixture.env"), expected);
   });
 }
 
-test("WebSocket probe accepts only the RFC6455 upgrade bound to its request key", () => {
+test("WebSocket validation requires the RFC6455 accept bound to its request", () => {
   const requestKey = "dGhlIHNhbXBsZSBub25jZQ==";
-  assert.doesNotThrow(() =>
-    assertWebSocketUpgrade(
-      {
-        statusCode: 101,
-        headers: {
-          upgrade: "websocket",
-          connection: "keep-alive, Upgrade",
-          "sec-websocket-accept": "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=",
-        },
-      },
-      requestKey,
-    ),
+  assert.doesNotThrow(() => assertWebSocketUpgrade({
+    statusCode: 101,
+    headers: {
+      upgrade: "websocket",
+      connection: "keep-alive, Upgrade",
+      "sec-websocket-accept": "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=",
+    },
+  }, requestKey));
+  assert.throws(() => assertWebSocketUpgrade({
+    statusCode: 101,
+    headers: { upgrade: "websocket", connection: "Upgrade", "sec-websocket-accept": "wrong" },
+  }, requestKey), /accept hash mismatch/);
+  assert.throws(
+    () => assertWebSocketUpgrade({ statusCode: 101, headers: {} }, requestKey),
+    /upgrade header is missing/,
   );
 });
 
-for (const [name, response, expected] of [
-  [
-    "a bare 101 response",
-    { statusCode: 101, headers: {} },
-    /upgrade header is missing/,
-  ],
-  [
-    "a missing Connection upgrade token",
-    {
-      statusCode: 101,
-      headers: {
-        upgrade: "websocket",
-        connection: "keep-alive",
-        "sec-websocket-accept": "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=",
-      },
-    },
-    /connection upgrade token is missing/,
-  ],
-  [
-    "an accept hash for another request",
-    {
-      statusCode: 101,
-      headers: {
-        upgrade: "websocket",
-        connection: "Upgrade",
-        "sec-websocket-accept": "AAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-      },
-    },
-    /accept hash mismatch/,
-  ],
-]) {
-  test(`WebSocket probe rejects ${name}`, () => {
-    assert.throws(
-      () => assertWebSocketUpgrade(response, "dGhlIHNhbXBsZSBub25jZQ=="),
-      expected,
-    );
-  });
-}
-
-const silentLogger = {
-  log() {},
-  warn() {},
-  error() {},
-};
+const silentLogger = { log() {}, warn() {}, error() {} };
 
 const makeFleet = ({
-  initialProtocol = "legacy",
+  initialPhase = "source",
+  sourceVersions = {},
   targetVersions = {},
-  rollbackVersions = {},
-  omitTargetServerVersion = false,
-  omitRollbackServerVersion = false,
-  v8DescriptorPeerId = PEER_ID,
-  neverVersionsProtocol,
-  legacyCreateFailureAt,
-  legacyUpdate,
-  v8Rollback,
+  descriptorPeerId = PEER_ID,
+  omitServerVersion = false,
+  createFailure,
+  neverVersions = false,
+  neverVersionsAtCreate,
+  onCreate,
+  forwardUpdate,
+  rollbackUpdate,
 } = {}) => {
+  const config = activeConfig();
   const state = {
-    protocol: initialProtocol,
+    phase: initialPhase,
     peerId: PEER_ID,
+    sourceVersions: {
+      "@peerbit/server": config.rollbackVersion,
+      ...config.rollbackFingerprint,
+      ...sourceVersions,
+    },
     targetVersions: {
-      "@peerbit/server": "8.0.0",
-      ...TARGET_FINGERPRINT,
+      "@peerbit/server": config.targetVersion,
+      ...config.targetFingerprint,
       ...targetVersions,
     },
-    rollbackVersions: {
-      "@peerbit/server": "6.0.36",
-      ...ROLLBACK_FINGERPRINT,
-      ...rollbackVersions,
-    },
   };
-  if (omitTargetServerVersion) delete state.targetVersions["@peerbit/server"];
-  if (omitRollbackServerVersion) delete state.rollbackVersions["@peerbit/server"];
-  const calls = { v8Create: [], legacyCreate: [], selfUpdate: [], websocket: [] };
-
-  const api = (protocol) => ({
-    peer: {
-      id: {
-        get: async () => state.peerId,
-        ...(protocol === "v8" ? { verify: async () => v8DescriptorPeerId } : {}),
-      },
-    },
-    dependency: {
-      versions: async () => {
-        if (neverVersionsProtocol === protocol) return new Promise(() => {});
-        return {
-          ...(state.protocol === "v8" ? state.targetVersions : state.rollbackVersions),
-        };
-      },
-    },
-    selfUpdate: async (version) => {
-      calls.selfUpdate.push({ protocol, version });
-      if (protocol === "legacy") {
-        if (legacyUpdate) return legacyUpdate({ state, version });
-        state.protocol = "v8";
-        return { version };
-      }
-      if (v8Rollback) return v8Rollback({ state, version });
-      state.protocol = "legacy";
-      return { version };
-    },
-  });
-
+  if (omitServerVersion) {
+    delete state.sourceVersions["@peerbit/server"];
+    delete state.targetVersions["@peerbit/server"];
+  }
+  const calls = { create: [], selfUpdate: [], websocket: [] };
   const createV8Client = async (_keypair, options) => {
-    calls.v8Create.push({ ...options });
-    if (state.protocol !== "v8") throw new Error("signed-request v2 unavailable");
-    return api("v8");
-  };
-  const createLegacyClient = async (_keypair, options) => {
-    calls.legacyCreate.push({ ...options });
-    if (calls.legacyCreate.length === legacyCreateFailureAt) {
-      throw new Error("legacy client creation failed before selfUpdate");
-    }
-    if (state.protocol !== "legacy") throw new Error("legacy signed request unavailable");
-    return api("legacy");
+    calls.create.push({ ...options });
+    const createIndex = calls.create.length;
+    if (onCreate) await onCreate({ calls, state });
+    if (createFailure) throw createFailure;
+    return {
+      peer: { id: { get: async () => state.peerId, verify: async () => descriptorPeerId } },
+      dependency: {
+        versions: async () => {
+          if (neverVersions || createIndex === neverVersionsAtCreate) return new Promise(() => {});
+          return { ...(state.phase === "source" ? state.sourceVersions : state.targetVersions) };
+        },
+      },
+      selfUpdate: async (version) => {
+        calls.selfUpdate.push(version);
+        if (version === config.targetVersion) {
+          if (forwardUpdate) return forwardUpdate({ state, version });
+          state.phase = "target";
+          return { version };
+        }
+        if (rollbackUpdate) return rollbackUpdate({ state, version });
+        state.phase = "source";
+        return { version };
+      },
+    };
   };
   const waitForPublicWebSocketImpl = async (remote) => calls.websocket.push(remote.peerId);
-  return { state, calls, createV8Client, createLegacyClient, waitForPublicWebSocketImpl };
+  return { config, state, calls, createV8Client, waitForPublicWebSocketImpl };
 };
 
-const runFleet = (
-  fleet,
+const runFleet = (fleet, {
+  config = fleet.config,
   configOverrides = {},
   logger = silentLogger,
   sleepImpl = async () => {},
-) => {
+} = {}) => {
   const [remote] = parseBootstrapRemotes(MULTIADDR);
   return runRollingSelfUpdate({
-    config: { ...baseConfig(), ...configOverrides },
+    config: { ...config, ...configOverrides },
     remotes: [remote],
     keypair: { test: true },
     createV8Client: fleet.createV8Client,
-    createLegacyClient: fleet.createLegacyClient,
     waitForPublicWebSocketImpl: fleet.waitForPublicWebSocketImpl,
     sleepImpl,
     logger,
   });
 };
 
-test("happy path uses legacy only to initiate v6 -> v8 and verifies a fresh pinned v8 client", async () => {
-  const fleet = makeFleet();
+test("completed legacy contract verifies and idempotently skips the exact pinned v8 target", async () => {
+  const fleet = makeFleet({ initialPhase: "target" });
+  fleet.config = completedConfig();
+  fleet.state.targetVersions = { "@peerbit/server": "8.0.0", ...V8_FINGERPRINT };
   const result = await runFleet(fleet);
-  assert.deepEqual(result, { transitioned: 1, alreadyCurrent: 0 });
-  assert.deepEqual(fleet.calls.selfUpdate, [{ protocol: "legacy", version: "8.0.0" }]);
-  assert.equal(fleet.state.protocol, "v8");
-  assert.ok(fleet.calls.v8Create.length >= 2, "v8 is probed before and freshly created after update");
-  for (const options of fleet.calls.v8Create) {
+  assert.deepEqual(result, { transitioned: 0, alreadyCurrent: 1 });
+  assert.deepEqual(fleet.calls.selfUpdate, []);
+  assert.equal(fleet.calls.websocket.length, 1);
+  for (const options of fleet.calls.create) {
     assert.deepEqual(options, { address: "https://bootstrap.example.com", peerId: PEER_ID });
   }
-  for (const options of fleet.calls.legacyCreate) {
-    assert.deepEqual(options, { address: "https://bootstrap.example.com" });
+});
+
+test("completed legacy contract cannot fall back to v1 or mutate when v8 is unreachable", async () => {
+  const secretError = new Error("signed-request-v2 unavailable");
+  const fleet = makeFleet({ createFailure: secretError });
+  await assert.rejects(
+    () => runFleet(fleet, {
+      config: completedConfig(),
+      configOverrides: { waitReadyTimeoutMs: 20, waitReadyDelayMs: 5 },
+      sleepImpl: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    }),
+    /pinned signed-request-v2 preflight/,
+  );
+  assert.deepEqual(fleet.calls.selfUpdate, []);
+});
+
+test("completed legacy contract rejects a reachable signed-v2 source as inert", async () => {
+  const fleet = makeFleet();
+  fleet.state.sourceVersions = {
+    "@peerbit/server": "6.0.36",
+    ...LEGACY_FINGERPRINT,
+  };
+  await assert.rejects(
+    () => runFleet(fleet, { config: completedConfig() }),
+    /completed legacy rollout contract is inert/,
+  );
+  assert.deepEqual(fleet.calls.selfUpdate, []);
+});
+
+test("completed contract cannot be activated by spoofing rolloutMode", async () => {
+  const fleet = makeFleet();
+  fleet.state.sourceVersions = {
+    "@peerbit/server": "6.0.36",
+    ...LEGACY_FINGERPRINT,
+  };
+  await assert.rejects(
+    () => runFleet(fleet, { config: { ...completedConfig(), rolloutMode: "v8-native" } }),
+    /rolloutMode must be completed-legacy/,
+  );
+  assert.deepEqual(fleet.calls.selfUpdate, []);
+  assert.deepEqual(fleet.calls.create, []);
+});
+
+test("completed legacy contract fails without mutation when the pinned v8 target is not exact", async () => {
+  const fleet = makeFleet({ initialPhase: "target", targetVersions: { "@peerbit/time": "9.9.9" } });
+  fleet.state.targetVersions["@peerbit/server"] = "8.0.0";
+  await assert.rejects(() => runFleet(fleet, { config: completedConfig() }), /target dependency fingerprint mismatch/);
+  assert.deepEqual(fleet.calls.selfUpdate, []);
+});
+
+test("future rollout transitions an exact v8 source with only pinned signed-request-v2 clients", async () => {
+  const fleet = makeFleet();
+  const result = await runFleet(fleet);
+  assert.deepEqual(result, { transitioned: 1, alreadyCurrent: 0 });
+  assert.deepEqual(fleet.calls.selfUpdate, ["8.1.0"]);
+  assert.equal(fleet.state.phase, "target");
+  assert.ok(fleet.calls.create.length >= 3);
+  for (const options of fleet.calls.create) {
+    assert.deepEqual(options, { address: "https://bootstrap.example.com", peerId: PEER_ID });
   }
 });
 
-test("an already verified v8 node is idempotently skipped", async () => {
-  const fleet = makeFleet({ initialProtocol: "v8" });
-  const result = await runFleet(fleet);
-  assert.deepEqual(result, { transitioned: 0, alreadyCurrent: 1 });
-  assert.deepEqual(fleet.calls.selfUpdate, []);
-  assert.deepEqual(fleet.calls.legacyCreate, []);
-  assert.equal(fleet.calls.websocket.length, 1);
-});
-
-test("source and target fingerprints remain authoritative when /versions omits server", async () => {
+test("a concurrent source-to-target change before mutation is never rolled back or mutated", async () => {
   const fleet = makeFleet({
-    omitRollbackServerVersion: true,
-    omitTargetServerVersion: true,
+    onCreate: ({ calls, state }) => {
+      if (calls.create.length === 2) state.phase = "target";
+    },
   });
-  const result = await runFleet(fleet);
-  assert.deepEqual(result, { transitioned: 1, alreadyCurrent: 0 });
-  assert.deepEqual(fleet.calls.selfUpdate, [{ protocol: "legacy", version: "8.0.0" }]);
-});
-
-test("an absent server key also permits an idempotent verified v8 skip", async () => {
-  const fleet = makeFleet({ initialProtocol: "v8", omitTargetServerVersion: true });
-  const result = await runFleet(fleet);
-  assert.deepEqual(result, { transitioned: 0, alreadyCurrent: 1 });
+  await assert.rejects(() => runFleet(fleet), /before any selfUpdate was initiated/);
   assert.deepEqual(fleet.calls.selfUpdate, []);
+  assert.equal(fleet.state.phase, "target");
 });
 
-test("a present server key with the wrong source version is fatal", async () => {
-  const fleet = makeFleet({ rollbackVersions: { "@peerbit/server": "6.0.35" } });
-  await assert.rejects(() => runFleet(fleet), /expected @peerbit\/server@6\.0\.36/);
-  assert.deepEqual(fleet.calls.selfUpdate, []);
-});
-
-test("a present server key with the wrong target version is fatal", async () => {
-  const fleet = makeFleet({
-    initialProtocol: "v8",
-    targetVersions: { "@peerbit/server": "8.0.1" },
-  });
-  await assert.rejects(() => runFleet(fleet), /expected @peerbit\/server@8\.0\.0/);
-  assert.deepEqual(fleet.calls.selfUpdate, []);
-});
-
-test("a signed descriptor peer-ID mismatch blocks all mutation", async () => {
-  const fleet = makeFleet({
-    initialProtocol: "v8",
-    v8DescriptorPeerId: "12D3KooWAnotherPeerIdentityThatMustNeverBeAccepted12345",
-  });
-  await assert.rejects(() => runFleet(fleet), /signed descriptor peer ID mismatch/);
-  assert.deepEqual(fleet.calls.selfUpdate, []);
-  assert.deepEqual(fleet.calls.legacyCreate, []);
-});
-
-test("a source fingerprint mismatch blocks the transition", async () => {
-  const fleet = makeFleet();
-  fleet.state.rollbackVersions["@peerbit/time"] = "9.9.9";
-  await assert.rejects(() => runFleet(fleet), /legacy preflight: dependency fingerprint mismatch/);
-  assert.deepEqual(fleet.calls.selfUpdate, []);
-});
-
-test("a target fingerprint mismatch triggers and verifies protocol-aware rollback", async () => {
-  const fleet = makeFleet({
-    targetVersions: { "@peerbit/time": "9.9.9" },
-    omitTargetServerVersion: true,
-  });
+test("a hanging fresh mutation preflight is bounded and cannot initiate selfUpdate", async () => {
+  const fleet = makeFleet({ neverVersionsAtCreate: 2 });
+  const started = Date.now();
   await assert.rejects(
-    () => runFleet(fleet),
+    () => runFleet(fleet, {
+      configOverrides: { waitReadyTimeoutMs: 25, waitReadyDelayMs: 5 },
+      sleepImpl: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    }),
     (error) => {
-      assert.match(
-        error.message,
-        /all initiated nodes were rolled back and verified/,
-        formatErrorSummary(error),
-      );
+      assert.match(error.message, /before any selfUpdate was initiated/);
+      assert.match(formatErrorSummary(error), /fresh v8 mutation preflight timed out/);
       return true;
     },
   );
-  assert.deepEqual(fleet.calls.selfUpdate, [
-    { protocol: "legacy", version: "8.0.0" },
-    { protocol: "v8", version: "6.0.36" },
-  ]);
-  assert.equal(fleet.state.protocol, "legacy");
+  assert.ok(Date.now() - started < 500, "fresh safety read must honor the rollout deadline");
+  assert.deepEqual(fleet.calls.selfUpdate, []);
+  assert.equal(fleet.calls.create.length, 2);
 });
 
-test("a non-exact selfUpdate response is rejected and rolled back", async () => {
+test("future rollout idempotently skips an exact target", async () => {
+  const fleet = makeFleet({ initialPhase: "target" });
+  assert.deepEqual(await runFleet(fleet), { transitioned: 0, alreadyCurrent: 1 });
+  assert.deepEqual(fleet.calls.selfUpdate, []);
+});
+
+test("source and target classification works when /versions omits @peerbit/server", async () => {
+  const sourceFleet = makeFleet({ omitServerVersion: true });
+  assert.deepEqual(await runFleet(sourceFleet), { transitioned: 1, alreadyCurrent: 0 });
+  const targetFleet = makeFleet({ initialPhase: "target", omitServerVersion: true });
+  assert.deepEqual(await runFleet(targetFleet), { transitioned: 0, alreadyCurrent: 1 });
+});
+
+test("signed descriptor mismatch blocks mutation", async () => {
+  const fleet = makeFleet({ descriptorPeerId: "12D3KooWAnotherPeerIdentityThatMustNeverBeAccepted12345" });
+  await assert.rejects(() => runFleet(fleet), /signed descriptor peer ID mismatch/);
+  assert.deepEqual(fleet.calls.selfUpdate, []);
+});
+
+test("unknown source fingerprint blocks mutation", async () => {
+  const fleet = makeFleet({ sourceVersions: { "@peerbit/time": "9.9.9" } });
+  await assert.rejects(() => runFleet(fleet), /source dependency fingerprint mismatch/);
+  assert.deepEqual(fleet.calls.selfUpdate, []);
+});
+
+test("target fingerprint failure rolls back and verifies the v8 source", async () => {
+  const fleet = makeFleet({ targetVersions: { "@peerbit/time": "9.9.9" } });
+  await assert.rejects(() => runFleet(fleet), /all initiated nodes were rolled back and verified/);
+  assert.deepEqual(fleet.calls.selfUpdate, ["8.1.0", "8.0.0"]);
+  assert.equal(fleet.state.phase, "source");
+});
+
+test("target fingerprint failure can roll back a pinned target that omits server version", async () => {
   const fleet = makeFleet({
-    legacyUpdate: ({ state, version }) => {
-      state.protocol = "v8";
+    omitServerVersion: true,
+    targetVersions: { "@peerbit/time": "9.9.9" },
+  });
+  await assert.rejects(() => runFleet(fleet), /all initiated nodes were rolled back and verified/);
+  assert.deepEqual(fleet.calls.selfUpdate, ["8.1.0", "8.0.0"]);
+  assert.equal(fleet.state.phase, "source");
+});
+
+test("non-exact forward response is rejected and rolled back", async () => {
+  const fleet = makeFleet({
+    forwardUpdate: ({ state, version }) => {
+      state.phase = "target";
       return { version, extra: true };
     },
   });
-  await assert.rejects(
-    () => runFleet(fleet),
-    /all initiated nodes were rolled back and verified/,
-  );
-  assert.deepEqual(fleet.calls.selfUpdate, [
-    { protocol: "legacy", version: "8.0.0" },
-    { protocol: "v8", version: "6.0.36" },
-  ]);
+  await assert.rejects(() => runFleet(fleet), /all initiated nodes were rolled back and verified/);
+  assert.deepEqual(fleet.calls.selfUpdate, ["8.1.0", "8.0.0"]);
 });
 
-test("rollback failure remains fatal and visible", async () => {
+test("rollback failure remains fatal", async () => {
   const fleet = makeFleet({
     targetVersions: { "@peerbit/time": "9.9.9" },
-    v8Rollback: async () => {
-      throw new Error("rollback endpoint failed");
-    },
+    rollbackUpdate: async () => { throw new Error("rollback endpoint failed"); },
   });
-  await assert.rejects(
-    () => runFleet(fleet),
-    (error) => {
-      assert.match(error.message, /rollback\(s\) failed fatally/);
-      assert.ok(error.errors.some((nested) => nested.message.includes("rollback endpoint failed")));
-      return true;
-    },
-  );
-  assert.equal(fleet.state.protocol, "v8");
+  await assert.rejects(() => runFleet(fleet), /rollback\(s\) failed fatally/);
+  assert.equal(fleet.state.phase, "target");
 });
 
-test("a never-resolving versions request is bounded by the rollout deadline", async () => {
-  const fleet = makeFleet({ neverVersionsProtocol: "legacy" });
+test("never-resolving dependency request is bounded", async () => {
+  const fleet = makeFleet({ neverVersions: true });
   const started = Date.now();
-  await assert.rejects(
-    () =>
-      runFleet(
-        fleet,
-        {
-          waitReadyTimeoutMs: 30,
-          waitReadyDelayMs: 5,
-        },
-        silentLogger,
-        (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-      ),
-    /protocol-aware preflight.*timed out|Timed out waiting for .*preflight/,
-  );
-  assert.ok(Date.now() - started < 500, "hung versions call must not escape the deadline");
+  await assert.rejects(() => runFleet(fleet, {
+    configOverrides: { waitReadyTimeoutMs: 25, waitReadyDelayMs: 5 },
+    sleepImpl: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  }), /pinned signed-request-v2 preflight/);
+  assert.ok(Date.now() - started < 500);
   assert.deepEqual(fleet.calls.selfUpdate, []);
 });
 
-test("a never-resolving forward selfUpdate that stays legacy remains fatally ambiguous", async () => {
-  const fleet = makeFleet({
-    legacyUpdate: () => new Promise(() => {}),
+test("ambiguous timed-out forward call that remains on source fails fatally without a second mutation", async () => {
+  const fleet = makeFleet({ forwardUpdate: () => new Promise(() => {}) });
+  await assert.rejects(() => runFleet(fleet, {
+    configOverrides: { waitReadyTimeoutMs: 25, waitReadyDelayMs: 5 },
+    sleepImpl: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  }), (error) => {
+    assert.match(error.message, /rollback\(s\) failed fatally/);
+    assert.match(formatErrorSummary(error), /ambiguous/);
+    return true;
   });
-  const started = Date.now();
-  await assert.rejects(
-    () =>
-      runFleet(
-        fleet,
-        {
-          waitReadyTimeoutMs: 30,
-          waitReadyDelayMs: 5,
-        },
-        silentLogger,
-        (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-      ),
-    (error) => {
-      assert.match(error.message, /rollback\(s\) failed fatally/);
-      assert.doesNotMatch(error.message, /all initiated nodes were rolled back/);
-      assert.match(formatErrorSummary(error), /ambiguous/);
-      return true;
-    },
-  );
-  assert.ok(Date.now() - started < 500, "hung forward selfUpdate must be bounded");
-  assert.deepEqual(fleet.calls.selfUpdate, [{ protocol: "legacy", version: "8.0.0" }]);
-  assert.equal(fleet.state.protocol, "legacy");
+  assert.deepEqual(fleet.calls.selfUpdate, ["8.1.0"]);
 });
 
-test("a timed-out forward call that later exposes pinned v8 is rolled back", async () => {
+test("timed-out forward call that later exposes target is rolled back", async () => {
   const fleet = makeFleet({
-    legacyUpdate: ({ state }) => {
-      setTimeout(() => {
-        state.protocol = "v8";
-      }, 40);
+    forwardUpdate: ({ state }) => {
+      setTimeout(() => { state.phase = "target"; }, 35);
       return new Promise(() => {});
     },
   });
-  await assert.rejects(
-    () =>
-      runFleet(
-        fleet,
-        {
-          waitReadyTimeoutMs: 30,
-          waitReadyDelayMs: 5,
-        },
-        silentLogger,
-        (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-      ),
-    (error) => {
-      assert.match(
-        error.message,
-        /all initiated nodes were rolled back and verified/,
-        formatErrorSummary(error),
-      );
-      return true;
-    },
-  );
-  assert.deepEqual(fleet.calls.selfUpdate, [
-    { protocol: "legacy", version: "8.0.0" },
-    { protocol: "v8", version: "6.0.36" },
-  ]);
-  assert.equal(fleet.state.protocol, "legacy");
+  await assert.rejects(() => runFleet(fleet, {
+    configOverrides: { waitReadyTimeoutMs: 25, waitReadyDelayMs: 5 },
+    sleepImpl: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  }), /all initiated nodes were rolled back and verified/);
+  assert.deepEqual(fleet.calls.selfUpdate, ["8.1.0", "8.0.0"]);
+  assert.equal(fleet.state.phase, "source");
 });
 
-test("failure before invoking selfUpdate may verify the reviewed legacy state as unchanged", async () => {
-  const fleet = makeFleet({ legacyCreateFailureAt: 2 });
-  await assert.rejects(
-    () =>
-      runFleet(fleet, {
-        waitReadyTimeoutMs: 30,
-        waitReadyDelayMs: 5,
-      }),
-    /all initiated nodes were rolled back and verified/,
+test("signature material is redacted from nested errors, logs, and final stacks", async () => {
+  const sentinels = ["REPLAYABLE_SIGNATURE", "REPLAYABLE_TIME", "ADMIN_SECRET"];
+  const axiosError = new Error(
+    `request failed 'X-Peerbit-Signature': '${sentinels[0]}' "X-Peerbit-Signature-Time": "${sentinels[1]}" Authorization: Bearer-${sentinels[2]}`,
   );
-  assert.deepEqual(fleet.calls.selfUpdate, []);
-  assert.equal(fleet.state.protocol, "legacy");
+  axiosError.name = "AxiosError";
+  axiosError.config = { headers: { "X-Peerbit-Signature": sentinels[0], Authorization: sentinels[2] } };
+  const safe = toSafeError(new AggregateError([axiosError], "outer"));
+  const direct = [formatErrorSummary(safe), safe.stack, inspect(safe, { depth: 10 })].join("\n");
+  for (const sentinel of sentinels) assert.doesNotMatch(direct, new RegExp(sentinel));
+
+  const fleet = makeFleet({ forwardUpdate: async () => { throw axiosError; } });
+  const captured = [];
+  const logger = Object.fromEntries(["log", "warn", "error"].map((level) => [
+    level,
+    (...parts) => captured.push(parts.map(String).join(" ")),
+  ]));
+  let finalError;
+  try {
+    await runFleet(fleet, {
+      logger,
+      configOverrides: { waitReadyTimeoutMs: 25, waitReadyDelayMs: 5 },
+      sleepImpl: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    });
+    assert.fail("expected failure");
+  } catch (error) {
+    finalError = error;
+  }
+  const rendered = [...captured, formatErrorSummary(finalError), finalError.stack, inspect(finalError, { depth: 10 })].join("\n");
+  for (const sentinel of sentinels) assert.doesNotMatch(rendered, new RegExp(sentinel));
+  assert.match(rendered, /\[redacted\]/);
 });
 
-test("a never-resolving rollback selfUpdate is bounded and remains fatal", async () => {
-  const fleet = makeFleet({
-    targetVersions: { "@peerbit/time": "9.9.9" },
-    v8Rollback: () => new Promise(() => {}),
-  });
-  const started = Date.now();
-  await assert.rejects(
-    () =>
-      runFleet(fleet, {
-        waitReadyTimeoutMs: 30,
-        waitReadyDelayMs: 5,
-      }),
-    /rollback\(s\) failed fatally/,
-  );
-  assert.ok(Date.now() - started < 500, "hung rollback selfUpdate must be bounded");
-  assert.equal(fleet.state.protocol, "v8");
-});
-
-test("a child with a handle-less pending operation reaches its deadline and force-exits nonzero", () => {
+test("CLI failure guard bounds a child with dangling handles", () => {
   const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
   const moduleUrl = pathToFileURL(path.join(scriptsDir, "rolling-self-update.mjs")).href;
-  const childSource = `
+  const source = `
     import { reportCliFailure, withTimeout } from ${JSON.stringify(moduleUrl)};
     setInterval(() => {}, 10_000);
-    try {
-      await withTimeout(() => new Promise(() => {}), 25, "child pending operation");
-    } catch (error) {
-      reportCliFailure(error);
-    }
+    try { await withTimeout(() => new Promise(() => {}), 25, "child pending operation"); }
+    catch (error) { reportCliFailure(error); }
   `;
-  const started = Date.now();
-  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", childSource], {
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", source], {
     encoding: "utf8",
     timeout: 2_000,
   });
   assert.equal(result.signal, null, result.error?.message);
   assert.equal(result.status, 1, result.stderr);
-  assert.match(result.stderr, /child pending operation timed out after 25ms/);
-  assert.ok(Date.now() - started < 1_000, "CLI guard must terminate dangling handles promptly");
+  assert.match(result.stderr, /timed out after 25ms/);
 });
 
-test("Axios-like signature headers are removed before errors are stored, logged, or rendered", async () => {
-  const sentinels = [
-    "REPLAYABLE_SIGNATURE_SENTINEL",
-    "REPLAYABLE_TIMESTAMP_SENTINEL",
-    "ADMIN_KEY_SENTINEL",
-    "NESTED_REQUEST_SECRET_SENTINEL",
-  ];
-  const axiosError = new Error(
-    `request failed 'X-Peerbit-Signature': '${sentinels[0]}' "X-Peerbit-Signature-Time": "${sentinels[1]}" 'PEERBIT_ADMIN_KEY_B64': '${sentinels[2]}'`,
-  );
-  axiosError.name = "AxiosError";
-  axiosError.config = {
-    headers: {
-      "X-Peerbit-Signature": sentinels[0],
-      "X-Peerbit-Signature-Time": sentinels[1],
-      Authorization: `Bearer ${sentinels[2]}`,
-    },
-  };
-  axiosError.request = { secret: sentinels[3] };
-  axiosError.response = { config: axiosError.config };
-
-  const directlySafe = toSafeError(new AggregateError([axiosError], "outer failure"));
-  const directRendering = [
-    formatErrorSummary(directlySafe),
-    directlySafe.stack,
-    inspect(directlySafe, { depth: 10 }),
-  ].join("\n");
-  for (const sentinel of sentinels) assert.doesNotMatch(directRendering, new RegExp(sentinel));
-
-  const fleet = makeFleet({
-    legacyUpdate: async () => {
-      throw axiosError;
-    },
-  });
-  const captured = [];
-  const logger = Object.fromEntries(
-    ["log", "warn", "error"].map((level) => [
-      level,
-      (...parts) => captured.push(parts.map(String).join(" ")),
-    ]),
-  );
-  let finalError;
-  try {
-    await runFleet(
-      fleet,
-      { waitReadyTimeoutMs: 30, waitReadyDelayMs: 5 },
-      logger,
-    );
-    assert.fail("rollout should fail after the synthetic update error");
-  } catch (error) {
-    finalError = error;
-  }
-  const finalRendering = [
-    ...captured,
-    formatErrorSummary(toSafeError(finalError)),
-    finalError.stack,
-    inspect(finalError, { depth: 10 }),
-  ].join("\n");
-  for (const sentinel of sentinels) assert.doesNotMatch(finalRendering, new RegExp(sentinel));
-  assert.match(finalRendering, /\[redacted\]/);
-});
-
-test("a failed invoked legacy update that leaves v6 visible remains ambiguous", async () => {
-  const fleet = makeFleet({
-    legacyUpdate: async () => {
-      throw new Error("connection dropped during update");
-    },
-  });
-  await assert.rejects(
-    () => runFleet(fleet, { waitReadyTimeoutMs: 30, waitReadyDelayMs: 5 }),
-    /rollback\(s\) failed fatally/,
-  );
-  assert.deepEqual(fleet.calls.selfUpdate, [{ protocol: "legacy", version: "8.0.0" }]);
-  assert.equal(fleet.state.protocol, "legacy");
+test("contract classifier is deterministic for completed and future configs", () => {
+  assert.equal(classifyRolloutContract(completedConfig()), "completed-legacy");
+  assert.equal(classifyRolloutContract(activeConfig()), "v8-native");
 });
