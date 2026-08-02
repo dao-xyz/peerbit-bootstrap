@@ -1,7 +1,7 @@
 {
   "bootstrapFile": "bootstrap-5.env",
   "expectedCurrentVersion": "8.0.0",
-  "targetVersion": "8.0.5",
+  "targetVersion": "8.0.6",
   "rollbackVersion": "8.0.0",
   "targetIntegrity": "sha512-O+Xgsgn+hBxVr5APEbP/PPT/ILKLi9WBtzXb2ugP6z4QNX8As0Sqk5i9zCFqcl1keovmDBNHcix666FhgiT0Sw==",
   "rollbackIntegrity": "sha512-D4xWIfN9erw3ap/b2SQXzYhHHN1UfSWi2DjfYhcgDKUwl9ivJQKLYxbsLe72ZJvKCm2iGyG4Gq9z0dTAjxMo/w==",
