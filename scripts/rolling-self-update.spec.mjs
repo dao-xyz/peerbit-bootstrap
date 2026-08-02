@@ -207,7 +207,7 @@ test("config validator rejects config path traversal before reading", (t) => {
   );
 });
 
-test("the repository's unchanged completed config validates without an admin secret", () => {
+test("the repository's reviewed active config validates without an admin secret", () => {
   const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
   const repoRoot = path.dirname(scriptsDir);
   const env = { ...process.env };
@@ -218,7 +218,15 @@ test("the repository's unchanged completed config validates without an admin sec
     { cwd: repoRoot, env, encoding: "utf8" },
   );
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(JSON.parse(result.stdout).targetVersion, "8.0.0");
+  const config = readAndValidateRolloutConfig({
+    configFile: "rollouts/bootstrap-5.json",
+    repoRoot,
+  });
+  const output = JSON.parse(result.stdout);
+  assert.equal(config.rolloutMode, "v8-native");
+  assert.equal(output.expectedCurrentVersion, config.expectedCurrentVersion);
+  assert.equal(output.targetVersion, config.targetVersion);
+  assert.equal(output.rollbackVersion, config.rollbackVersion);
 });
 
 test("bootstrap parsing retains the exact /p2p peer ID", () => {
