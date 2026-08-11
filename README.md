@@ -105,6 +105,21 @@ preflight and rollback result. CI validates the config, lockfile, package metada
 state-machine tests, and high/critical dependency audit before the production job
 can access its secret.
 
+The current npm graph has a temporary exception for only CVE-2025-71330 and
+CVE-2025-71329 on the exact reviewed Peerbit WebRTC to React Native to Metro
+dependency path and the `image-size -> queue -> inherits` runtime tail. The
+validator permits only the exact current `@peerbit/server@8.0.7 ->
+peerbit@5.3.17` tuple or the reviewed rollout target `@peerbit/server@8.0.13 ->
+peerbit@5.3.23`, and pins every reviewed package version, registry tarball URL,
+integrity, dependency edge, owner, lockfile classification, remediation flag,
+and npm audit node. Any drift in the reviewed exception subgraph, or any
+non-clean audit closure other than the exact exception, is fatal. The exception
+expires at `2026-08-22T00:00:00Z`; both validation and the production job recheck
+it before a relay can be updated. No patched `image-size` release currently
+exists, so this is an expiring exception rather than a remediation claim; the
+vulnerable path must be replaced or the exception reviewed again before that
+deadline.
+
 Rollouts run only from a reviewed `master` push; direct arbitrary-version dispatch
 and broad secret inheritance are disabled. The production environment provides
 `PEERBIT_ADMIN_KEY_B64`, containing the base64-encoded serialized Peerbit admin
