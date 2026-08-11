@@ -51,7 +51,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 22.x
+          node-version: 22.23.2
 
       - name: Validate and build assets
         run: node scripts/build-bootstrap.mjs
@@ -83,7 +83,7 @@ jobs:
         run: |
           npm run validate:rollout
           npm ls @peerbit/crypto @peerbit/server
-          npm audit --omit=dev --audit-level=high
+          npm run security:audit
 
       - name: Test rollout state machine
         run: npm run test:rollout
