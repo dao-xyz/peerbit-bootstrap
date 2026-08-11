@@ -8,7 +8,10 @@
     "verify:public": "node scripts/verify-public.mjs",
     "rolling-self-update": "node scripts/rolling-self-update.mjs",
     "validate:rollout": "node scripts/rolling-self-update.mjs --validate-config --config-file rollouts/bootstrap-5.json",
-    "test:rollout": "node --test scripts/rolling-self-update.spec.mjs"
+    "test:rollout": "node --test scripts/rolling-self-update.spec.mjs",
+    "test:security-audit": "node --test scripts/image-size-advisory-exception.spec.mjs",
+    "validate:security-audit": "node scripts/validate-image-size-audit.mjs",
+    "security:audit": "npm run test:security-audit && npm run validate:security-audit"
   },
   "dependencies": {
     "@dao-xyz/borsh": "^6.0.1",
