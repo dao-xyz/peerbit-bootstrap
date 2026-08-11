@@ -28,10 +28,40 @@ jobs:
       - name: Install locked rollout dependencies
         run: npm ci --ignore-scripts --no-audit --no-fund
 
+      - name: Assert React Native peer subtree is absent
+        run: |
+          for pkg in react-native metro metro-config metro-transform-worker image-size; do
+            if [ -e "node_modules/$pkg" ]; then
+              echo "forbidden package installed: $pkg"
+              exit 1
+            fi
+          done
+          node -e 'for (const p of ["react-native", "metro", "metro-config", "metro-transform-worker", "image-size"]) { try { require.resolve(p); console.error("forbidden package resolves: " + p); process.exit(1); } catch {} }'
+          node -e 'const l = require("./package-lock.json"); const bad = Object.entries(l.packages).filter(([k, v]) => v.peer || /\/(react-native|metro|metro-config|metro-transform-worker|image-size)$/.test(k)); if (bad.length > 0) { console.error("peer subtree in lockfile: " + bad.map(([k]) => k).join(", ")); process.exit(1); }'
+
       - name: Validate migration contract
         run: |
           node scripts/rolling-self-update.mjs --validate-config --config-file rollouts/bootstrap-5.json
-          npm run security:audit
+          npm audit --omit=dev --omit=peer --audit-level=high
+
+      - name: Smoke test rollout runtime imports
+        run: |
+          node --input-type=module -e '
+            const [server, crypto, borsh] = await Promise.all([
+              import("@peerbit/server"),
+              import("@peerbit/crypto"),
+              import("@dao-xyz/borsh"),
+            ]);
+            const failures = [];
+            if (typeof server.createClient !== "function") failures.push("@peerbit/server.createClient");
+            if (typeof crypto.Ed25519Keypair !== "function") failures.push("@peerbit/crypto.Ed25519Keypair");
+            if (typeof borsh.deserialize !== "function") failures.push("@dao-xyz/borsh.deserialize");
+            if (failures.length > 0) {
+              console.error("missing runtime surface: " + failures.join(", "));
+              process.exit(1);
+            }
+            console.log("runtime import surface verified");
+          '
 
       - name: Test rollout state machine
         run: npm run test:rollout
@@ -58,8 +88,38 @@ jobs:
       - name: Install locked rollout dependencies
         run: npm ci --ignore-scripts --no-audit --no-fund
 
-      - name: Revalidate temporary dependency exception
-        run: npm run security:audit
+      - name: Assert React Native peer subtree is absent
+        run: |
+          for pkg in react-native metro metro-config metro-transform-worker image-size; do
+            if [ -e "node_modules/$pkg" ]; then
+              echo "forbidden package installed: $pkg"
+              exit 1
+            fi
+          done
+          node -e 'for (const p of ["react-native", "metro", "metro-config", "metro-transform-worker", "image-size"]) { try { require.resolve(p); console.error("forbidden package resolves: " + p); process.exit(1); } catch {} }'
+          node -e 'const l = require("./package-lock.json"); const bad = Object.entries(l.packages).filter(([k, v]) => v.peer || /\/(react-native|metro|metro-config|metro-transform-worker|image-size)$/.test(k)); if (bad.length > 0) { console.error("peer subtree in lockfile: " + bad.map(([k]) => k).join(", ")); process.exit(1); }'
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --omit=peer --audit-level=high
+
+      - name: Smoke test rollout runtime imports
+        run: |
+          node --input-type=module -e '
+            const [server, crypto, borsh] = await Promise.all([
+              import("@peerbit/server"),
+              import("@peerbit/crypto"),
+              import("@dao-xyz/borsh"),
+            ]);
+            const failures = [];
+            if (typeof server.createClient !== "function") failures.push("@peerbit/server.createClient");
+            if (typeof crypto.Ed25519Keypair !== "function") failures.push("@peerbit/crypto.Ed25519Keypair");
+            if (typeof borsh.deserialize !== "function") failures.push("@dao-xyz/borsh.deserialize");
+            if (failures.length > 0) {
+              console.error("missing runtime surface: " + failures.join(", "));
+              process.exit(1);
+            }
+            console.log("runtime import surface verified");
+          '
 
       - name: Rolling self-update
         env:
