@@ -63,6 +63,22 @@ repository and probes every advertised relay for:
 - the exact advertised peer ID; and
 - a valid WebSocket upgrade and accept hash on port 4003.
 
+### Outage alerts
+
+When a run fails, the monitor opens one `bootstrap-outage` issue, which notifies
+repository watchers. Set the repository variable `MONITOR_ALERT_MENTION` (for
+example `@some-user`) to mention someone in it as well. Later failures only update
+the issue's `Last failure:` line, so a long outage does not send repeated
+notifications. The next healthy run comments on the issue and closes it. Its
+`GITHUB_TOKEN` gets `issues: write` for this and nothing else.
+
+To test alerting, dispatch the monitor with `simulate_failure` checked. The run
+fails on purpose and opens the issue. A normal dispatch afterwards closes it.
+
+GitHub runs scheduled workflows on a best-effort basis. On 2026-09-30/10-01 the
+15-minute schedule ran only every 3-6 hours. An external uptime check on
+`https://<relay>:9002/peer/id` detects outages faster.
+
 ## Relay provisioning
 
 Automated relay provisioning is temporarily disabled. The previous workflow

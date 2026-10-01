@@ -4,9 +4,16 @@ on:
   schedule:
     - cron: "7,22,37,52 * * * *"
   workflow_dispatch:
+    inputs:
+      simulate_failure:
+        description: "Fail on purpose to test outage alerting (opens the outage issue)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+  # Only used to open and close the outage tracking issue below.
+  issues: write
 
 concurrency:
   group: monitor-bootstrap-production
@@ -39,3 +46,60 @@ jobs:
 
       - name: Probe relay DNS, TLS, peer identity, and WebSocket
         run: node scripts/monitor-relays.mjs
+
+      - name: Simulated failure (alerting drill)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.simulate_failure }}
+        run: |
+          echo "::error::Simulated failure requested to test outage alerting"
+          exit 1
+
+      # A failing probe must reach people. Open one tracking issue, which notifies
+      # repository watchers (and MONITOR_ALERT_MENTION, if set), keep it updated
+      # without repeat notifications while the outage lasts, and close it on the
+      # next healthy run.
+      - name: Open or refresh the outage issue
+        if: ${{ failure() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ALERT_MENTION: ${{ vars.MONITOR_ALERT_MENTION }}
+        run: |
+          set -euo pipefail
+          label=bootstrap-outage
+          now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          body_file=$(mktemp)
+          gh label create "$label" --color B60205 --description "Bootstrap production monitor is failing" --force >/dev/null
+          number=$(gh issue list --label "$label" --state open --limit 1 --json number --jq '.[0].number // empty')
+          if [ -n "$number" ]; then
+            gh issue view "$number" --json body --jq .body | grep -v '^Last failure: ' > "$body_file" || true
+            printf 'Last failure: %s (%s)\n' "$now" "$RUN_URL" >> "$body_file"
+            gh issue edit "$number" --body-file "$body_file" >/dev/null
+            echo "Updated outage issue #$number"
+          else
+            {
+              printf 'The bootstrap production monitor failed. Peerbit clients may be unable to bootstrap.\n\n'
+              printf 'First failure: %s (%s)\n' "$now" "$RUN_URL"
+              printf 'Last failure: %s (%s)\n' "$now" "$RUN_URL"
+              if [ -n "${ALERT_MENTION:-}" ]; then
+                printf '\ncc %s\n' "$ALERT_MENTION"
+              fi
+              printf '\nThis issue is closed automatically by the next healthy monitor run.\n'
+            } > "$body_file"
+            gh issue create --label "$label" --title "Bootstrap production monitor is failing" --body-file "$body_file"
+          fi
+
+      - name: Close the outage issue after recovery
+        if: ${{ success() }}
+        # Issue bookkeeping must never turn a healthy probe red.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          for number in $(gh issue list --label bootstrap-outage --state open --json number --jq '.[].number'); do
+            gh issue close "$number" --comment "Recovered: the monitor passed at $now ($RUN_URL)."
+          done
