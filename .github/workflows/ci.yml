@@ -27,6 +27,9 @@ on:
       - ".github/workflows/ci.yml"
       - ".github/workflows/deploy-bootstrap-rollout.yml"
       - ".github/workflows/monitor.yml"
+  # Redeploy the current master assets on demand (for example after a change
+  # that the push-time change detection cannot see).
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -132,14 +135,16 @@ jobs:
           AFTER_SHA: ${{ github.sha }}
         run: |
           changed="$(git diff --name-only "$BEFORE_SHA" "$AFTER_SHA")"
-          if rg --quiet '^(bootstrap-[^/]+\.env|static/.*|scripts/build-bootstrap\.mjs|tools/wrangler/.*|wrangler\.jsonc)$' <<<"$changed"; then
+          # grep, not rg: ripgrep is not installed on the hosted runner, and a
+          # missing command here silently reported "no static changes".
+          if grep -qE '^(bootstrap-[^/]+\.env|static/.*|scripts/build-bootstrap\.mjs|tools/wrangler/.*|wrangler\.jsonc)$' <<<"$changed"; then
             echo "static_changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "static_changed=false" >> "$GITHUB_OUTPUT"
           fi
 
   deploy:
-    if: github.ref == 'refs/heads/master' && github.event_name == 'push' && needs.validate.outputs.static_changed == 'true'
+    if: github.ref == 'refs/heads/master' && ((github.event_name == 'push' && needs.validate.outputs.static_changed == 'true') || github.event_name == 'workflow_dispatch')
     needs: validate
     runs-on: ubuntu-24.04
     timeout-minutes: 15
