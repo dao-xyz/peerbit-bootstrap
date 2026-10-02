@@ -1,11 +1,19 @@
 {
   "bootstrapFile": "bootstrap-5.env",
-  "expectedCurrentVersion": "8.0.20",
-  "targetVersion": "8.0.37",
-  "rollbackVersion": "8.0.20",
-  "targetIntegrity": "sha512-y8O3x0NTr+F2BzpCKlt349q5nPSj553mMg0/O/lRvGkJLD9zoTzq8OTS3LPHoQzE19L9PtyDyEq9NQwaJRbvnQ==",
-  "rollbackIntegrity": "sha512-QMiiqKU8iaeNOcuXLuYeVq+gtT1hBJkHX/Kv0ZwNZ2JizyVAFIKKGMNJr2wfiBD/RKHbqrnXzF1jYdPrl+7yRA==",
+  "expectedCurrentVersion": "8.0.37",
+  "targetVersion": "8.0.38",
+  "rollbackVersion": "8.0.37",
+  "targetIntegrity": "sha512-GJmKjz2Q6W+MqgkV3FCZzg55R2A4m4N8wL/pQx7wQBDyigydF1SubFw8o9Hmd2q5quFEH8gNe6tQgHxM+0cd5g==",
+  "rollbackIntegrity": "sha512-y8O3x0NTr+F2BzpCKlt349q5nPSj553mMg0/O/lRvGkJLD9zoTzq8OTS3LPHoQzE19L9PtyDyEq9NQwaJRbvnQ==",
   "targetFingerprint": {
+    "peerbit": "5.4.9",
+    "@peerbit/blocks": "4.3.3",
+    "@peerbit/crypto": "3.1.6",
+    "@peerbit/program": "6.0.67",
+    "@peerbit/pubsub": "5.4.12",
+    "@peerbit/time": "3.0.1"
+  },
+  "rollbackFingerprint": {
     "peerbit": "5.4.8",
     "@peerbit/blocks": "4.3.3",
     "@peerbit/crypto": "3.1.6",
@@ -13,17 +21,9 @@
     "@peerbit/pubsub": "5.4.11",
     "@peerbit/time": "3.0.1"
   },
-  "rollbackFingerprint": {
-    "peerbit": "5.3.30",
-    "@peerbit/blocks": "4.2.11",
-    "@peerbit/crypto": "3.1.6",
-    "@peerbit/program": "6.0.52",
-    "@peerbit/pubsub": "5.4.2",
-    "@peerbit/time": "3.0.1"
-  },
   "batchSize": 1,
   "waitReadyTimeoutMs": 180000,
   "waitReadyDelayMs": 3000,
   "rollbackOnFailure": true,
-  "rerollReason": "peerbit-server-8.0.37-release-rollout"
+  "rerollReason": "peerbit-server-8.0.38-release-rollout"
 }
